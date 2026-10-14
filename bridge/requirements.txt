@@ -1,0 +1,14 @@
+# wb-bridge 运行依赖
+#   pip install -r requirements.txt
+
+# --- 必需 ---
+bleak>=0.22            # BLE 主机端（Windows 走 WinRT）
+pyserial>=3.5          # monitor.py / scan.py / serial_listen.py
+numpy>=1.24            # ADPCM 解码、音频诊断
+
+# --- 语音转写（不装则 /voice 与语音发送不可用，其余功能正常）---
+faster-whisper>=1.2    # 本地 Whisper 推理（ctranslate2 后端）
+huggingface_hub>=0.23
+
+# --- 可选 ---
+zhconv>=1.4            # 繁体 -> 简体兜底；固件字库是 GB2312 简体子集，缺了会变空格

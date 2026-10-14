@@ -1,0 +1,1440 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wb-bridge v3 —— WorkBuddy <-> AI Passport 双向中转服务
+
+AI Passport（ESP32-C3）自己读不到 PC 上的 WorkBuddy 数据，也不会跑 ASR。
+本服务跑在 PC 侧，做三件事：
+
+  1. 下行：把 WorkBuddy 本机数据归约成固件能消费的小帧，经 BLE FF01 推送
+     （状态 / 对话列表 / 消息流 / 额度 / 发送结果）
+  2. 上行：接收工牌的按键、选择、语音帧、发送请求（BLE FF02 Notify）
+  3. 语音闭环：拼 WAV -> 本地 Whisper 转写 -> 发送到指定对话 -> 回执
+
+数据源（全部免认证、只读）：
+  A. ~/.workbuddy/sessions/<pid>.json          会话心跳
+  B. ~/.workbuddy/workbuddy.db                 sessions / session_usage 表
+  C. ~/.workbuddy/projects/<slug>/<sid>.jsonl  对话消息流
+
+协议（与固件 main/wb_proto.h 一一对应）：
+  下行帧  AA cmd seq total payload
+  上行帧  BB cmd payload
+"""
+
+import glob
+import json
+import os
+import queue
+import re
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+WB_HOME      = Path(os.environ.get("USERPROFILE", "~")) / ".workbuddy"
+SESSIONS_DIR = WB_HOME / "sessions"
+WORKBUDDY_DB = WB_HOME / "workbuddy.db"
+PROJECTS_DIR = WB_HOME / "projects"
+MAIN_LOG     = WB_HOME / "logs" / "main.log"
+
+BRIDGE_DIR   = Path(__file__).resolve().parent
+VOICE_DIR    = BRIDGE_DIR / "voice_out"
+
+HTTP_PORT     = 8765
+POLL_INTERVAL = 2
+
+OFFLINE_AFTER_MS = 60_000
+
+# 协议限制（必须与 wb_proto.h 一致）
+TITLE_MAX     = 32
+LIST_MAX      = 5         # 下发给工牌的对话条数；屏幕一屏 5 行，不做翻页
+MSG_PAGE_MAX  = 10        # 固件 MSG_SLOTS
+MSG_BODY_MAX  = 120       # WB_TEXT_LEN
+ASR_BODY_MAX  = 170       # 转写回显 ≤ WB_ASR_LEN(200)，留帧头 + UTF-8 余量
+VOICE_MAX_SEC = 60        # 语音上限，防呆
+
+# WorkBuddy 本地 CLI —— **兜底路径**。
+# 正常发送走下面的网关 REST（见 _discover / send_to_workbuddy）；只有在网关
+# 发现失败时才退回 CLI 子进程，而那条路在独立进程里拿不到登录态，基本不可用。
+# 两个路径都可以用环境变量覆盖。
+_LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA")
+                     or (Path.home() / "AppData" / "Local"))
+CLI_DIR  = Path(os.environ.get("WB_CLI_DIR")
+                or (_LOCALAPPDATA / "Programs" / "WorkBuddy" / "resources"
+                    / "app.asar.unpacked" / "cli"))
+
+
+def _find_node():
+    """定位随 WorkBuddy 一起安装的 node；找不到就信 PATH 里的 node。"""
+    env = os.environ.get("WB_NODE_EXE")
+    if env:
+        return Path(env)
+    versions = Path.home() / ".workbuddy" / "binaries" / "node" / "versions"
+    if versions.is_dir():
+        found = sorted(versions.glob("*/node.exe"))
+        if found:
+            return found[-1]
+    return Path("node")
+
+
+NODE_EXE = _find_node()
+
+# Whisper
+WHISPER_MODEL = os.environ.get("WB_WHISPER_MODEL", "small")
+WHISPER_LANG  = os.environ.get("WB_WHISPER_LANG", "zh")
+
+# huggingface_hub 新版默认走 xet 原生后端下载，实测在 Windows 上会把进程
+# 打成段错误（下完 model.bin 就崩）。这里强制退回传统 HTTP 下载。
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+# 语音负载编码（与固件 main/wb_proto.h 的 WB_VOICE_CODEC_* 对齐）
+VOICE_CODEC_PCM16 = 0
+VOICE_CODEC_ADPCM = 1
+
+# ---------------------------------------------------------------------------
+# 状态常量
+# ---------------------------------------------------------------------------
+
+STATE_IDLE, STATE_BUSY, STATE_OFFLINE = 0, 1, 2
+NAME_OF = {STATE_IDLE: "IDLE", STATE_BUSY: "BUSY", STATE_OFFLINE: "OFFLINE"}
+
+CONV_WORKING, CONV_DONE, CONV_ERROR = 0, 1, 2
+
+# 下行 cmd
+D_STATUS, D_CONV, D_MSG, D_USAGE, D_INFO, D_VOICE, D_SENT, D_CLEAR = range(1, 9)
+D_ASR = 9
+# 上行 cmd
+U_KEY, U_SELECT, U_REQ, U_VOICE_START, U_VOICE_DATA, U_VOICE_END, \
+    U_VOICE_ABORT, U_SEND = range(1, 9)
+U_CONFIRM = 9
+
+# 语音提交模式（WB_U_SEND payload[1]）
+SEND_AUTO, SEND_CONFIRM = 0, 1
+
+REQ_ALL, REQ_LIST, REQ_MSG, REQ_USAGE = 0, 1, 2, 3
+
+
+# ===========================================================================
+# 工具
+# ===========================================================================
+
+# 固件字库白名单（由 ai-passport/fonts/gen_font.js 与 symbols.txt 同源）
+# 不在这个集合里的字符固件渲染不出来（会变豆腐块），下发前必须替换掉。
+FONT_SYMBOLS = BRIDGE_DIR.parent / "ai-passport" / "fonts" / "symbols.txt"
+
+
+def _load_font_chars():
+    try:
+        return set(FONT_SYMBOLS.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"[warn] 字库白名单读取失败({e})，降级为范围判断")
+        return None
+
+
+_FONT_CHARS = _load_font_chars()
+
+
+def clean(s):
+    """净化文本，使其能被固件字库完整渲染。
+
+    - 控制字符（\\r \\n \\t）→ 空格
+    - 字库外的字符（emoji / 生僻符号）→ 空格
+    - 压缩连续空格、去掉首尾空白
+
+    替换成空格而不是 '?'，避免标题里出现一串问号。
+    """
+    if not s:
+        return ""
+    out = []
+    prev_sp = True                      # 抑制开头空格
+    for ch in s:
+        if ch in "\r\n\t":
+            ch = " "
+        elif _FONT_CHARS is not None:
+            if ch not in _FONT_CHARS:
+                ch = " "
+        elif not ch.isprintable() or ord(ch) > 0x9FFF:
+            ch = " "                    # 无白名单时的降级判断
+        if ch == " ":
+            if prev_sp:
+                continue
+            prev_sp = True
+        else:
+            prev_sp = False
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def cut_utf8(s, n):
+    """按 UTF-8 安全截断到 <= n 字节，不切断多字节字符。"""
+    b = (s or "").encode("utf-8")
+    if len(b) <= n:
+        return b
+    b = b[:n]
+    while b and (b[-1] & 0xC0) == 0x80:
+        b = b[:-1]
+    if b and (b[-1] & 0xC0) == 0xC0:
+        b = b[:-1]
+    return b
+
+
+def frame(cmd, seq=0, total=1, payload=b""):
+    """下行帧：AA cmd seq total payload"""
+    return bytes([0xAA, cmd, seq & 0xFF, total & 0xFF]) + payload
+
+
+def status_frame(st):
+    name = cut_utf8(clean(st.get("task") or ""), TITLE_MAX)
+    up = min(int(st.get("uptime_s", 0)), 65535)
+    flags = (0x01 if name else 0) | (0x02 if st.get("online") else 0)
+    pl = bytes([st.get("state", STATE_OFFLINE), flags, up & 0xFF, (up >> 8) & 0xFF,
+                len(name)]) + name
+    return frame(D_STATUS, 0, 1, pl)
+
+
+def conv_frame(i, total, c):
+    t = cut_utf8(clean(c.get("title") or ""), TITLE_MAX)
+    st = c.get("status") or ""
+    code = CONV_WORKING if st == "working" else CONV_ERROR if st in ("error", "failed") \
+        else CONV_DONE
+    return frame(D_CONV, i, total, bytes([code, len(t)]) + t)
+
+
+def msg_frame(i, total, m):
+    t = cut_utf8(clean(m.get("text") or ""), MSG_BODY_MAX)
+    role = 1 if m.get("role") == "assistant" else 0
+    return frame(D_MSG, i, total, bytes([role, len(t)]) + t)
+
+
+def usage_frame(used_x10, total_x10):
+    return frame(D_USAGE, 0, 1, f"{int(used_x10)}|{int(total_x10)}".encode())
+
+
+def info_frame(text):
+    return frame(D_INFO, 0, 1, cut_utf8(clean(text), 26))
+
+
+def sent_frame(ok, text):
+    return frame(D_SENT, 0, 1, bytes([0 if ok else 1]) + cut_utf8(clean(text), 36))
+
+
+def asr_frame(ok, text):
+    """转写回显：摊到工牌屏幕上等人确认，本身不投递。"""
+    return frame(D_ASR, 0, 1,
+                 bytes([0 if ok else 1]) + cut_utf8(clean(text), ASR_BODY_MAX))
+
+
+def clear_frame(what=0):
+    return frame(D_CLEAR, 0, 1, bytes([what]))
+
+
+# ===========================================================================
+# 数据源 A：sessions 心跳
+# ===========================================================================
+
+def latest_heartbeat():
+    best = (None, None, None)
+    for f in glob.glob(str(SESSIONS_DIR / "*.json")):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if d.get("kind") != "interactive":
+            continue
+        hb = d.get("lastHeartbeat")
+        if isinstance(hb, (int, float)) and (best[0] is None or hb > best[0]):
+            best = (hb, d.get("cwd", ""), d.get("sessionId", ""))
+    return best
+
+
+# ===========================================================================
+# 数据源 B：workbuddy.db
+# ===========================================================================
+
+def _read_db():
+    if not WORKBUDDY_DB.exists():
+        return None
+    tmp = Path(tempfile.gettempdir()) / "wb_bridge_snapshot.db"
+    try:
+        shutil.copy2(WORKBUDDY_DB, tmp)
+    except (OSError, PermissionError):
+        try:
+            return sqlite3.connect(f"file:{WORKBUDDY_DB}?mode=ro", uri=True, timeout=1.0)
+        except sqlite3.Error:
+            return None
+    try:
+        return sqlite3.connect(str(tmp))
+    except sqlite3.Error:
+        return None
+
+
+def list_conversations(limit=LIST_MAX, offset=0):
+    con = _read_db()
+    if con is None:
+        return []
+    try:
+        rows = con.execute(
+            """
+            SELECT id, COALESCE(custom_title, title, '(untitled)'),
+                   status, model, last_activity_at, unread
+            FROM sessions
+            WHERE deleted_at IS NULL
+            ORDER BY last_activity_at DESC
+            LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
+    except sqlite3.Error:
+        con.close()
+        return []
+    con.close()
+    return [{
+        "id": sid,
+        "title": (title or "")[:TITLE_MAX],
+        "status": status or "unknown",
+        "model": model or "",
+        "updated_at": ts or 0,
+        "unread": unread or 0,
+    } for sid, title, status, model, ts, unread in rows]
+
+
+def get_running_conversation():
+    con = _read_db()
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            """
+            SELECT id, COALESCE(custom_title, title, ''), model, last_activity_at
+            FROM sessions
+            WHERE deleted_at IS NULL AND status = 'working'
+            ORDER BY last_activity_at DESC LIMIT 1
+            """).fetchone()
+    except sqlite3.Error:
+        con.close()
+        return None
+    con.close()
+    if not row:
+        return None
+    return {"id": row[0], "title": (row[1] or "")[:TITLE_MAX],
+            "model": row[2] or "", "updated_at": row[3] or 0}
+
+
+def get_usage(session_id=None):
+    con = _read_db()
+    if con is None:
+        return {"used": 0, "size": 0, "percent": 0, "credits": {}}
+    try:
+        if session_id:
+            row = con.execute(
+                "SELECT used, size, credit_json FROM session_usage WHERE session_id = ?",
+                (session_id,)).fetchone()
+        else:
+            row = con.execute(
+                """SELECT used, size, credit_json FROM session_usage
+                   ORDER BY updated_at DESC LIMIT 1""").fetchone()
+    except sqlite3.Error:
+        con.close()
+        return {"used": 0, "size": 0, "percent": 0, "credits": {}}
+    con.close()
+    if not row:
+        return {"used": 0, "size": 0, "percent": 0, "credits": {}}
+
+    used, size, credit_json = row
+    credits = {}
+    try:
+        raw = json.loads(credit_json or "{}")
+        items = sorted(raw.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        credits = {k[:16]: round(float(v), 2) for k, v in items}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    pct = int(used * 100 / size) if size else 0
+    return {"used": used or 0, "size": size or 0,
+            "percent": min(pct, 100), "credits": credits}
+
+
+# ===========================================================================
+# 数据源 C：对话消息流
+# ===========================================================================
+
+def _find_jsonl(session_id):
+    hits = glob.glob(str(PROJECTS_DIR / "**" / f"{session_id}.jsonl"), recursive=True)
+    return hits[0] if hits else None
+
+
+# 思考过程不上工牌：2.4 寸屏只放一问一答，中间那段推理链既占地方，
+# 又会让人误以为是要读的正文。块类型和行内标签两条路都堵掉。
+_SKIP_BLOCK = {"thinking", "reasoning", "analysis", "redacted_thinking"}
+_SKIP_TAG = re.compile(r"<(thinking|reasoning|analysis)\b[^>]*>.*?</\1>",
+                       re.S | re.I)
+
+
+def _extract_text(content):
+    if isinstance(content, str):
+        return _SKIP_TAG.sub("", content).strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for blk in content:
+        if not isinstance(blk, dict):
+            continue
+        if blk.get("type") in _SKIP_BLOCK:
+            continue
+        if blk.get("type") in ("input_text", "output_text", "text"):
+            t = blk.get("text") or ""
+            if "<system-reminder" in t or "<user_info>" in t:
+                continue
+            t = _SKIP_TAG.sub("", t).strip()
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def read_messages(session_id, page=0, page_size=MSG_PAGE_MAX):
+    """page 0 = 最新一页"""
+    path = _find_jsonl(session_id)
+    empty = {"total": 0, "page": page, "page_size": page_size,
+             "messages": [], "has_more": False}
+    if not path:
+        return empty
+
+    msgs = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("type") != "message":
+                    continue
+                role = o.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = _extract_text(o.get("content"))
+                if not text:
+                    continue
+                msgs.append({"role": role, "text": text[:MSG_BODY_MAX],
+                             "ts": o.get("timestamp", 0)})
+    except OSError:
+        return empty
+
+    total = len(msgs)
+    end = total - page * page_size
+    start = max(0, end - page_size)
+    if end <= 0:
+        return empty
+    return {"total": total, "page": page, "page_size": page_size,
+            "messages": msgs[start:end], "has_more": start > 0}
+
+
+# ===========================================================================
+# 归约
+# ===========================================================================
+
+_busy_since = None
+_prev_key = None
+
+
+def compute_state():
+    global _busy_since, _prev_key
+    now_ms = int(time.time() * 1000)
+
+    running = get_running_conversation()
+    # 只认近期还在活动的 working 记录：进程异常退出会留下僵尸 working 行，
+    # 不设时限会让工牌永远显示 BUSY。
+    if running and now_ms - (running.get("updated_at") or 0) > 30 * 60 * 1000:
+        running = None
+
+    # 这里永远不返回 OFFLINE：本函数能被调用本身就证明中转服务活着，
+    # 而"PC 侧不可用"只可能是 BLE 断开或服务死掉 —— 两种情况工牌都收不到本帧，
+    # 由工牌侧按 连接状态 + 收帧超时 自行判离线（wb_app.c 的 home_refresh）。
+    #
+    # 曾经拿 ~/.workbuddy/sessions/*.json 心跳当在线依据，结果常驻 OFFLINE：
+    # 那个文件只由交互式会话在活动时写，闲置几分钟就过期，而服务一直在推帧。
+    busy = running is not None
+
+    key = running["id"] if running else None
+    if busy and key != _prev_key:
+        _busy_since = time.time()
+    elif not busy:
+        _busy_since = None
+    _prev_key = key
+
+    usage = get_usage(running["id"] if running else None)
+    return {
+        "state": STATE_BUSY if busy else STATE_IDLE,
+        "task": running["title"] if running else None,
+        "uptime_s": int(time.time() - _busy_since) if _busy_since else 0,
+        "model": running["model"] if running else "",
+        "online": True,
+        "percent": usage.get("percent", 0),
+        "conv_id": running["id"] if running else None,
+    }
+
+
+# ===========================================================================
+# 语音：WAV + Whisper
+# ===========================================================================
+
+_whisper = None
+_whisper_lock = threading.Lock()
+
+# ---- IMA/DVI 4bit ADPCM 解码（与固件 main/wb_adpcm.c 同表同式）----
+_ADPCM_STEP = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
+    45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209,
+    230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876,
+    963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+    3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623,
+    27086, 29794, 32767,
+]
+_ADPCM_IDX = (-1, -1, -1, -1, 2, 4, 6, 8)
+
+
+def adpcm_decode(nib_data: bytes, seed: int) -> bytes:
+    """把 ADPCM 半字节流解回 16bit 小端 PCM。
+
+    每个包的预测器都用 seed 重置（固件端发包时同样重置），所以包与包
+    之间没有耦合 —— 丢一包只坏那 40ms，不会连锁。
+    """
+    step_tbl = _ADPCM_STEP
+    idx_tbl = _ADPCM_IDX
+    pred = seed & 0xFFFF
+    if pred >= 0x8000:
+        pred -= 0x10000
+    index = 0
+    out = bytearray()
+    ext = out.extend
+    for b in nib_data:
+        for nib in (b & 0x0F, (b >> 4) & 0x0F):
+            step = step_tbl[index]
+            vp = step >> 3
+            if nib & 4:
+                vp += step
+            if nib & 2:
+                vp += step >> 1
+            if nib & 1:
+                vp += step >> 2
+            pred = pred - vp if nib & 8 else pred + vp
+            if pred < -32768:
+                pred = -32768
+            elif pred > 32767:
+                pred = 32767
+            index += idx_tbl[nib & 7]
+            if index < 0:
+                index = 0
+            elif index > 88:
+                index = 88
+            ext(int(pred).to_bytes(2, "little", signed=True))
+    return bytes(out)
+
+
+def save_wav(pcm: bytes, path: Path, rate=8000):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+
+
+def diag_audio(pcm: bytes, rate: int, tag=""):
+    """打印一段 PCM 的客观指标，用来判断「录到的到底是不是语音」。
+
+    只做统计不做判断 —— 阈值靠人看，避免脚本自己骗自己。
+    """
+    import numpy as np
+
+    a = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if len(a) < 2:
+        print(f"[DIAG] {tag} empty", flush=True)
+        return
+    rms = float(np.sqrt((a ** 2).mean()))
+    peak = float(np.abs(a).max())
+    dc = float(a.mean())
+    clip = int((np.abs(a) >= 32700).sum())
+    # 16bit 满幅 -32768 与 +32767 是不对称的，单边贴边也算削顶
+    per = max(1, int(rate * 0.04))              # 40ms 一块 = 一个 ADPCM 包
+    nb = len(a) // per
+    brms = np.sqrt((a[:nb * per].reshape(nb, per) ** 2).mean(axis=1))
+    quiet = float((brms < 100).mean()) * 100.0
+
+    print(f"[DIAG] {tag} dur={len(a)/rate:.2f}s rms={rms:.0f} "
+          f"peak={peak:.0f} dc={dc:+.0f} clip={clip} quiet={quiet:.0f}%",
+          flush=True)
+    if nb:
+        top = np.argsort(brms)[::-1][:16]
+        print("[DIAG] 最响的块 (序号:40ms块的RMS) "
+              + " ".join(f"{int(i)}:{int(brms[i])}" for i in sorted(top)),
+              flush=True)
+        # 前 8 块单独列出：codec 上电瞬态就藏在这里
+        print("[DIAG] 开头8块RMS "
+              + " ".join(str(int(v)) for v in brms[:8]), flush=True)
+
+
+def load_wav_16k(path: Path):
+    """读 WAV -> 16kHz 单声道 float32。
+
+    刻意不用 PyAV：PyAV 19 删掉了 av.open 的 metadata_errors 参数，
+    而 faster-whisper 1.2.1 还在传它，一走 PyAV 就 TypeError。
+    我们的 WAV 是自己写的（单声道 16bit），直接解最省事也最稳。
+    """
+    import numpy as np
+
+    with wave.open(str(path), "rb") as w:
+        rate = w.getframerate()
+        ch = w.getnchannels()
+        sw = w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+
+    if sw != 2:
+        raise ValueError(f"unsupported sampwidth {sw}")
+    a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1)
+    if rate != 16000:
+        n = int(round(len(a) * 16000 / rate))
+        if n < 1:
+            return a
+        a = np.interp(np.arange(n) * (rate / 16000.0),
+                      np.arange(len(a)), a).astype(np.float32)
+    return a
+
+
+def _hf_cached(name: str) -> bool:
+    d = (Path.home() / ".cache" / "huggingface" / "hub"
+         / ("models--Systran--faster-whisper-" + name) / "snapshots")
+    try:
+        return d.is_dir() and any(d.iterdir())
+    except OSError:
+        return False
+
+
+def get_whisper():
+    """懒加载 faster-whisper。返回模型或 None（未安装/加载失败）。"""
+    global _whisper
+    with _whisper_lock:
+        if _whisper is None:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError:
+                return None
+            try:
+                _whisper = WhisperModel(
+                    WHISPER_MODEL, device="cpu", compute_type="int8",
+                    cpu_threads=4, num_workers=1,
+                    local_files_only=_hf_cached(WHISPER_MODEL))
+                print(f"[ASR] model {WHISPER_MODEL} ready", flush=True)
+            except Exception as e:            # noqa: BLE001
+                print(f"[ASR] load failed: {e}", flush=True)
+                print(f"[ASR] hint: WB_WHISPER_MODEL={WHISPER_MODEL} "
+                      f"cached={_hf_cached(WHISPER_MODEL)}", flush=True)
+                return None
+        return _whisper
+
+
+# Whisper 是"看着上文猜下文"的：喂一句普通话 + 简体的语域提示，
+# 它就会往简体上靠。实测能把大部分繁体输出掰回来，剩下几个犄角旮旯的字
+# 再由 _to_simplified 兜底 —— 固件字库是 GB2312 简体子集，
+# 繁体字过不了 clean()，会在屏幕上直接变成空格（缺字）。
+_ASR_PROMPT = "以下是普通话的日常对话，请用简体中文转写。"
+
+
+def _to_simplified(s):
+    """繁体 -> 简体兜底。zhconv 是纯 Python，没装也不影响主流程。"""
+    if not s:
+        return s
+    try:
+        from zhconv import convert
+    except ImportError:
+        return s
+    try:
+        return convert(s, "zh-cn")
+    except Exception:                         # noqa: BLE001
+        return s
+
+
+def transcribe(wav_path: Path):
+    m = get_whisper()
+    if m is None:
+        return None, "ASR offline"
+    try:
+        audio = load_wav_16k(wav_path)
+        # beam_size 给到 5：一句就两三秒，多花的几十毫秒换更稳的字，值。
+        segs, _info = m.transcribe(audio, language=WHISPER_LANG,
+                                   beam_size=5, vad_filter=True,
+                                   initial_prompt=_ASR_PROMPT,
+                                   condition_on_previous_text=False)
+        return _to_simplified("".join(s.text for s in segs).strip()), None
+    except Exception as e:                    # noqa: BLE001
+        return None, str(e)[:60]
+
+
+# ===========================================================================
+# 发送：WorkBuddy 本地网关 REST API
+# ===========================================================================
+# WorkBuddy GUI 自带一个本地 HTTP 网关（就是 `codebuddy --serve` 那一套）：
+#   POST /api/v1/runs               发起一次 Agent 运行
+#   GET  /api/v1/runs/:id/stream    SSE 读结果
+# 认证用 GUI 进程内随机生成的密钥 —— 它只通过环境变量注入给对话子进程，
+# **不落盘**，所以靠 gw_discover 从活着的子进程环境块里读出来，再扫端口定位。
+#
+# 为什么不用 `codebuddy -p`：那个是独立进程，没有账号登录态，
+# 会一直停在 "Authentication required" 上（实测永久卡死，无超时价值）。
+
+_GW = {"base": None, "password": None, "at": 0.0, "active": None}
+_GW_TTL = 1800.0          # GUI 不重启则端口/密钥不变，缓存半小时
+_SENDER_ID = "aipassport"  # 网关限流按 sender.id 分桶，默认桶名
+
+
+def _device_sender(ble) -> str:
+    """按设备 BLE 地址派生 sender id —— 每台设备独占一个限流桶。"""
+    peer = (getattr(ble, "peer", "") or "").replace(":", "").replace("-", "")
+    tail = peer[-6:]
+    return f"aipassport-{tail}" if tail else _SENDER_ID
+_gw_lock = threading.Lock()
+
+
+def _discover(force=False):
+    """惰性发现网关，缓存 5 分钟。返回 (base, password)。"""
+    with _gw_lock:
+        if (not force) and _GW["base"] and (time.time() - _GW["at"] < _GW_TTL):
+            return _GW["base"], _GW["password"]
+        try:
+            import gw_discover
+            info = gw_discover.discover_gateway()
+        except Exception as e:                        # noqa: BLE001
+            print(f"[GW] discover failed: {type(e).__name__}: {e}", flush=True)
+            info = None
+        if info:
+            _GW.update(base=info["base"], password=info["password"],
+                       at=time.time(), active=None)
+            print(f"[GW] {info['base']} pid={info['pid']} "
+                  f"cached={info.get('cached')}", flush=True)
+            return _GW["base"], _GW["password"]
+        _GW.update(base=None, password=None, at=time.time())
+        return None, None
+
+
+def gateway_active_session():
+    """当前 GUI 活跃会话 id。
+
+    注意：要走认证端点，**会消耗网关配额**，只用于诊断，别放进热路径。
+    """
+    base, pw = _discover()
+    if not base:
+        return None
+    try:
+        import gw_discover
+        st = gw_discover.probe_gateway(base, pw) or {}
+        return st.get("activeSessionId")
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
+def gateway_sessions(limit=10):
+    """从网关读会话列表（比翻 sqlite 更准，含 GUI 刚建的会话）。"""
+    base, pw = _discover()
+    if not base:
+        return []
+    req = urllib.request.Request(
+        f"{base}/api/v1/sessions",
+        headers={"Authorization": f"Bearer {pw}", "X-CodeBuddy-Request": "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:                                 # noqa: BLE001
+        return []
+    rows = ((body or {}).get("data") or {}).get("sessions") or []
+    return rows[:limit]
+
+
+def _post_run(base, pw, body, timeout=25):
+    req = urllib.request.Request(
+        f"{base}/api/v1/runs",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Authorization": f"Bearer {pw}",
+                 "X-CodeBuddy-Request": "1",
+                 "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _send_via_gateway(base, pw, session_id, text, sender_id, timeout=25):
+    run_id = uuid.uuid4().hex
+    conv = session_id or run_id
+    body = {
+        "id": run_id,
+        "type": "message",
+        "text": text,
+        "source": {
+            "platform": "generic",
+            "sender": {"id": sender_id, "name": "AI Passport"},
+            "conversation": {"id": conv, "type": "direct"},
+        },
+    }
+    payload = _post_run(base, pw, body, timeout=timeout)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("runId"):
+        raise RuntimeError(f"bad response: {str(payload)[:60]}")
+    print(f"[GW] run {str(data['runId'])[:8]} -> conv={str(conv)[:8]} "
+          f"sender={sender_id}", flush=True)
+    return data["runId"]
+
+
+def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
+    """把文本发给指定对话。返回 (ok, 回执文本)。
+
+    网关限流是**按 sender.id 分桶**的令牌桶：
+        maxPerMinute = 60        （很宽松）
+        maxConcurrent = 3        （同时最多 3 个未完成的 run）
+    所以：
+      * sender.id 用**设备自己的标识**，别多台设备共用一个桶；
+      * 真人一次说一句不会撞并发上限，但连点可能有，故做退避重试。
+    """
+    if not text or not text.strip():
+        return False, "empty text"
+    sender = sender_id or _SENDER_ID
+    base, pw = _discover()
+    if not base:
+        return False, "Gateway offline"
+
+    def attempt(b, p):
+        try:
+            _send_via_gateway(b, p, session_id, text, sender, timeout=timeout)
+            return True, "Sent"
+        except urllib.error.HTTPError as he:
+            if he.code == 429:
+                return False, "busy"
+            if he.code == 401:
+                return None                      # 密钥过期 -> 触发重发现
+            return False, f"HTTP {he.code}"
+        except Exception as e:                    # noqa: BLE001
+            return False, f"{type(e).__name__}"[:36]
+
+    last = (False, "unknown")
+    for i, wait in enumerate((0.0, 2.5, 5.0)):    # 退避：立刻 -> 2.5s -> 5s
+        if wait:
+            time.sleep(wait)
+        ok, msg = attempt(base, pw)
+        if ok is None:                            # 401：GUI 重启过，重新发现
+            base, pw = _discover(force=True)
+            if not base:
+                return False, "Gateway offline"
+            ok, msg = attempt(base, pw)
+        if ok:
+            return True, "Sent"
+        last = (ok, msg)
+        if msg != "busy":                         # 非并发问题就别重试了
+            break
+    return last[0], ("Busy, retry" if last[1] == "busy" else last[1])
+
+
+def send_to_workbuddy_cli(session_id, text, timeout=90):
+    """旧路径：本地 CLI。保留作兜底，但需要独立登录态，通常不可用。"""
+    cli = CLI_DIR / "bin" / "codebuddy"
+    if not cli.exists():
+        return False, "CLI missing"
+    if not NODE_EXE.exists():
+        return False, "node missing"
+
+    cmd = [str(NODE_EXE), str(cli), "-p", text, "--output-format", "text"]
+    if session_id:
+        cmd += ["-r", session_id]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, cwd=str(BRIDGE_DIR),
+                           encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except OSError as e:
+        return False, str(e)[:36]
+
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and out:
+        return True, out[:36]
+    err = (r.stderr or "").strip() or out or f"exit {r.returncode}"
+    return False, err[:36]
+
+
+# ===========================================================================
+# HTTP 调试端点
+# ===========================================================================
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        p, q = u.path, parse_qs(u.query)
+
+        def qs(name, default=None):
+            v = q.get(name)
+            return v[0] if v else default
+
+        try:
+            if p in ("/", "/status"):
+                st = compute_state()
+                self._send({**st, "state_name": NAME_OF.get(st["state"], "?")})
+
+            elif p == "/conversations":
+                limit = int(qs("limit", LIST_MAX))
+                offset = int(qs("offset", 0))
+                self._send({"items": list_conversations(limit, offset),
+                            "limit": limit, "offset": offset})
+
+            elif p == "/messages":
+                sid = qs("id")
+                if not sid:
+                    return self._send({"error": "missing id"}, 400)
+                self._send(read_messages(sid, int(qs("page", 0))))
+
+            elif p == "/usage":
+                self._send(get_usage(qs("id")))
+
+            elif p == "/health":
+                try:
+                    import faster_whisper  # noqa: F401
+                    asr_installed = True
+                except ImportError:
+                    asr_installed = False
+                self._send({"ok": True, "ts": int(time.time() * 1000),
+                            "sources": {
+                                "sessions": SESSIONS_DIR.exists(),
+                                "db": WORKBUDDY_DB.exists(),
+                                "projects": PROJECTS_DIR.exists(),
+                            },
+                            # loaded=模型已在内存；cached=权重已在本地
+                            # （没缓存的话首次转写要拉 483MB）
+                            "whisper": {"loaded": _whisper is not None,
+                                        "installed": asr_installed,
+                                        "model": WHISPER_MODEL,
+                                        "cached": _hf_cached(WHISPER_MODEL)}})
+
+            elif p == "/gw":
+                info = dict(_GW)
+                if info.get("password"):
+                    info["password"] = "***"
+                try:
+                    import gw_discover
+                    info["cached_port"] = gw_discover._load_cached_port()
+                except Exception:                     # noqa: BLE001
+                    info["cached_port"] = None
+                self._send({"ok": bool(_GW.get("base")), "gateway": info})
+
+            elif p == "/ble":
+                b = _BLE
+                self._send({
+                    "available": bool(b and b.available),
+                    "error": (b.last_error if b else "not_started"),
+                    "connected": bool(b and b.connected),
+                    "peer": (b.peer if b else None),
+                    "mtu": (b.mtu if b else 0),
+                    "pushed": (b.pushed if b else 0),
+                    "received": (b.received if b else 0),
+                    "voice_bytes": (len(b.voice_buf) if b else 0),
+                    "selected": (b.selected if b else -1),
+                })
+
+            elif p == "/voice":
+                files = sorted(VOICE_DIR.glob("*.wav"))[-8:] if VOICE_DIR.exists() else []
+                self._send({"dir": str(VOICE_DIR),
+                            "files": [f.name for f in files]})
+
+            elif p == "/font":
+                # 字库白名单诊断：确认哪些字符固件能渲染，以及净化效果
+                samples = [
+                    "介绍 AI Passport 有趣项目",
+                    "🚀 修复登录 bug ✅ 完成",
+                    "评估算力券补贴平台需求清单",
+                    "带\t制表符\n和换行   多余空格",
+                    "全角标点：测试。，！？——……",
+                ]
+                han = (len([c for c in _FONT_CHARS if 0x3400 <= ord(c) <= 0x9FFF])
+                       if _FONT_CHARS else 0)
+                self._send({
+                    "loaded": _FONT_CHARS is not None,
+                    "path": str(FONT_SYMBOLS),
+                    "chars": len(_FONT_CHARS) if _FONT_CHARS else 0,
+                    "han": han,
+                    "ascii": (len([c for c in _FONT_CHARS
+                                   if ord(c) < 0x80]) if _FONT_CHARS else 0),
+                    "samples": [{"in": s, "out": clean(s)} for s in samples],
+                })
+
+            elif p == "/push":
+                # 手动触发一次全量下发，便于调试
+                if _BLE:
+                    _BLE.push_all()
+                self._send({"ok": bool(_BLE and _BLE.connected)})
+
+            elif p == "/send":
+                # 诊断：跳过 ASR，直接把文本经网关发给指定对话
+                #   /send?text=hello[&conv=<sessionId>][&sender=<bucket>]
+                text = (q.get("text") or [""])[0]
+                conv = (q.get("conv") or [None])[0]
+                sender = (q.get("sender") or [None])[0]
+                t0 = time.time()
+                ok, msg = send_to_workbuddy(conv, text, sender_id=sender)
+                self._send({"ok": ok, "message": msg,
+                            "elapsed": round(time.time() - t0, 2),
+                            "conv": conv, "gateway": _GW.get("base")})
+
+            else:
+                self._send({"error": "not_found", "path": p}, 404)
+        except Exception as e:                # noqa: BLE001
+            self._send({"error": "internal", "message": str(e)}, 500)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def run_http():
+    srv = HTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
+    srv.serve_forever()
+
+
+# ===========================================================================
+# BLE 中心（工牌做外设，本服务做中心）
+# ===========================================================================
+
+class BleCenter(threading.Thread):
+    SVC_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
+    CHR_DOWN = "0000ff01-0000-1000-8000-00805f9b34fb"   # write
+    CHR_UP   = "0000ff02-0000-1000-8000-00805f9b34fb"   # notify
+    DEV_NAME = "AI-Passport"
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.available = False
+        self.last_error = None
+        self.connected = False
+        self.peer = None
+        self.mtu = 0
+        self.pushed = 0
+        self.received = 0
+
+        self.client = None
+        self.tx_queue = queue.Queue()
+        self.rx_queue = queue.Queue()
+
+        self.convs = []
+        self.selected = -1
+        self.msg_page = 0
+
+        self.voice_buf = bytearray()
+        self.voice_rate = 8000
+        self.voice_codec = VOICE_CODEC_PCM16
+        self.voice_last_seq = None
+        self.voice_lost = 0
+        self._vbuf_lock = threading.Lock()
+
+        # 已转写但还没投递的文本（工牌确认屏用的那份）
+        self.pending_text = ""
+        self.pending_idx = -1
+
+        # 连接后要自动全量推一次
+        self._push_all_pending = False
+
+        try:
+            import bleak  # noqa: F401
+            self.available = True
+        except ImportError:
+            self.last_error = "bleak not installed"
+
+    # ---- 对外接口（线程安全）----
+
+    def send(self, data: bytes):
+        self.tx_queue.put(data)
+
+    def push_all(self):
+        self._push_all_pending = True
+
+    # ---- 下行组装 ----
+
+    def _build_all_frames(self):
+        frames = []
+        st = compute_state()
+        frames.append(status_frame(st))
+
+        convs = list_conversations(LIST_MAX, 0)
+        self.convs = convs
+        total = len(convs)
+        for i, c in enumerate(convs):
+            frames.append(conv_frame(i, total, c))
+
+        usage = get_usage(st.get("conv_id"))
+        frames.append(usage_frame(round(usage["used"] * 10),
+                                  round(usage["size"] * 10)))
+        model = st.get("model") or "WorkBuddy"
+        frames.append(info_frame(model))
+        return frames
+
+    def _build_msg_frames(self, page):
+        if not (0 <= self.selected < len(self.convs)):
+            return []
+        sid = self.convs[self.selected]["id"]
+        r = read_messages(sid, page, MSG_PAGE_MAX)
+        msgs = r["messages"]
+        total = len(msgs)
+        return [msg_frame(i, total, m) for i, m in enumerate(msgs)]
+
+    # ---- 上行处理 ----
+
+    def _on_notify(self, _sender, data: bytearray):
+        if len(data) < 2 or data[0] != 0xBB:
+            return
+        cmd = data[1]
+        pl = bytes(data[2:])
+        self.received += 1
+
+        if cmd == U_VOICE_DATA:
+            # ADPCM 帧：seq16 + seed16 + 半字节流；PCM16 帧：seq16 + pcm[]
+            if self.voice_codec == VOICE_CODEC_ADPCM:
+                if len(pl) <= 4:
+                    return
+                seq = pl[0] | (pl[1] << 8)
+                seed = pl[2] | (pl[3] << 8)
+                if seed >= 0x8000:
+                    seed -= 0x10000
+                pcm = adpcm_decode(pl[4:], seed)
+            elif len(pl) > 2:
+                seq = pl[0] | (pl[1] << 8)
+                pcm = pl[2:]
+            else:
+                return
+
+            with self._vbuf_lock:
+                if self.voice_last_seq is not None:
+                    expect = (self.voice_last_seq + 1) & 0xFFFF
+                    if seq != expect:
+                        self.voice_lost += (seq - expect) & 0xFFFF
+                self.voice_last_seq = seq
+                if len(self.voice_buf) < VOICE_MAX_SEC * self.voice_rate * 2:
+                    self.voice_buf += pcm
+            return
+
+        self.rx_queue.put((cmd, pl))
+
+    # ---- 主循环 ----
+
+    def run(self):
+        if not self.available:
+            return
+        import asyncio
+        asyncio.run(self._loop())
+
+    async def _loop(self):
+        import asyncio
+        from bleak import BleakScanner, BleakClient
+
+        last_status = 0.0
+        while True:
+            try:
+                dev = await BleakScanner.find_device_by_filter(
+                    lambda d, ad: self.DEV_NAME in (ad.local_name or "")
+                    or (d.name or "").startswith(self.DEV_NAME),
+                    timeout=8.0)
+                if not dev:
+                    await asyncio.sleep(3)
+                    continue
+
+                async with BleakClient(dev) as client:
+                    self.client = client
+                    self.connected = True
+                    self.peer = dev.address
+                    self.last_error = None
+                    self.mtu = getattr(client, "mtu_size", 0) or 0
+                    print(f"[BLE] connected {dev.address} mtu={self.mtu}", flush=True)
+
+                    await client.start_notify(self.CHR_UP, self._on_notify)
+                    self._push_all_pending = True
+
+                    while client.is_connected:
+                        if self._push_all_pending:
+                            self._push_all_pending = False
+                            for f in self._build_all_frames():
+                                await self._write(f)
+                                await asyncio.sleep(0.02)
+                            last_status = time.time()
+
+                        now = time.time()
+                        if now - last_status >= POLL_INTERVAL:
+                            await self._write(status_frame(compute_state()))
+                            last_status = now
+
+                        while not self.tx_queue.empty():
+                            f = self.tx_queue.get_nowait()
+                            await self._write(f)
+                            await asyncio.sleep(0.01)
+
+                        await asyncio.sleep(0.05)
+            except Exception as e:            # noqa: BLE001
+                self.connected = False
+                self.peer = None
+                self.client = None
+                self.last_error = str(e)[:120]
+                await asyncio.sleep(4)
+
+    async def _write(self, data: bytes):
+        try:
+            await self.client.write_gatt_char(self.CHR_DOWN, data, response=False)
+            self.pushed += 1
+        except Exception as e:                # noqa: BLE001
+            self.last_error = str(e)[:120]
+
+
+# ===========================================================================
+# 工作线程：消费上行事件（转写、发送都在这儿，避免阻塞 BLE 循环）
+# ===========================================================================
+
+def bridge_worker(ble: BleCenter):
+    while True:
+        cmd, pl = ble.rx_queue.get()
+
+        if cmd == U_REQ:
+            what = pl[0] if len(pl) >= 1 else REQ_ALL
+            page = pl[1] if len(pl) >= 2 else 0
+            print(f"[RX] req what={what} page={page}", flush=True)
+            if what in (REQ_ALL, REQ_LIST):
+                ble.push_all()
+            elif what == REQ_MSG:
+                ble.msg_page = page
+                for f in ble._build_msg_frames(page):
+                    ble.send(f)
+            elif what == REQ_USAGE:
+                st = compute_state()
+                u = get_usage(st.get("conv_id"))
+                ble.send(usage_frame(round(u["used"] * 10), round(u["size"] * 10)))
+
+        elif cmd == U_SELECT:
+            if len(pl) >= 1:
+                ble.selected = pl[0]
+                print(f"[RX] select conv={ble.selected}", flush=True)
+
+        elif cmd == U_VOICE_START:
+            with ble._vbuf_lock:
+                ble.voice_buf = bytearray()
+            ble.voice_rate = (pl[0] | (pl[1] << 8)) if len(pl) >= 2 else 8000
+            ble.voice_codec = pl[2] if len(pl) >= 3 else VOICE_CODEC_PCM16
+            ble.voice_last_seq = None
+            ble.voice_lost = 0
+            print(f"[RX] voice start @{ble.voice_rate}Hz "
+                  f"codec={'ADPCM' if ble.voice_codec else 'PCM16'}", flush=True)
+
+        elif cmd == U_VOICE_END:
+            with ble._vbuf_lock:
+                n = len(ble.voice_buf)
+            print(f"[RX] voice end, {n} bytes, seq_lost={ble.voice_lost}",
+                  flush=True)
+
+        elif cmd == U_VOICE_ABORT:
+            with ble._vbuf_lock:
+                ble.voice_buf = bytearray()
+            print("[RX] voice abort", flush=True)
+
+        elif cmd == U_SEND:
+            idx = pl[0] if len(pl) >= 1 else ble.selected
+            mode = pl[1] if len(pl) >= 2 else SEND_AUTO
+            handle_voice_send(ble, idx, mode)
+
+        elif cmd == U_CONFIRM:
+            idx = pl[0] if pl else ble.selected
+            handle_confirm(ble, idx)
+
+        elif cmd == U_KEY:
+            pass  # 诊断用，忽略
+
+
+def _pick_target_session(ble: BleCenter, idx: int):
+    """决定这句话投到哪个对话，返回 (session_id, 来源标签)。
+
+    优先用网关的**活跃会话**，也就是 WorkBuddy 窗口里此刻开着的那一个。
+
+    之前直接用 ble.convs[idx] 的 id（PC 数据库里的会话 id），投递确实成功了、
+    会话文件里也落了字，但 GUI 不会因为一条外部消息就切过去，用户眼前的窗口
+    毫无变化 —— 于是就成了"工牌显示 SENT，电脑却像没反应"。
+
+    设备端列表从此只当"浏览入口"用；真正投递一律跟着 GUI 走。
+    """
+    active = gateway_active_session()
+    if active:
+        return active, "active"
+    if 0 <= idx < len(ble.convs):
+        return ble.convs[idx]["id"], "device"
+    if ble.convs:
+        return ble.convs[0]["id"], "fallback"
+    return None, "none"
+
+
+def _deliver(ble: BleCenter, idx: int, text: str):
+    """真正投递一句话，并把回执推给工牌。"""
+    sid, how = _pick_target_session(ble, idx)
+    ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble))
+    if ok:
+        ble.send(sent_frame(True, reply or "Sent"))
+        ble.selected = idx
+        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how}", flush=True)
+    else:
+        print(f"[SEND] failed ({how}): {reply}", flush=True)
+        ble.send(sent_frame(False, reply))
+    ble.push_all()
+
+
+def handle_voice_send(ble: BleCenter, idx: int, mode: int = SEND_AUTO):
+    """语音闭环：存 WAV -> Whisper -> (回显等确认 | 直接投递) -> 回执"""
+    with ble._vbuf_lock:
+        pcm = bytes(ble.voice_buf)
+        ble.voice_buf = bytearray()
+
+    if len(pcm) < 1600:            # 少于 0.1 秒
+        ble.send(asr_frame(False, "Audio too short"))
+        ble.send(sent_frame(False, "Audio too short"))
+        return
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    wav = VOICE_DIR / f"{ts}.wav"
+    try:
+        save_wav(pcm, wav, ble.voice_rate)
+    except OSError as e:
+        ble.send(asr_frame(False, f"Save failed: {e}"[:36]))
+        ble.send(sent_frame(False, f"Save failed: {e}"[:36]))
+        return
+    print(f"[VOICE] saved {wav.name} ({len(pcm)} bytes)", flush=True)
+    diag_audio(pcm, ble.voice_rate, tag=wav.name)
+
+    text, err = transcribe(wav)
+    if err:
+        ble.send(asr_frame(False, f"ASR: {err}"[:36]))
+        ble.send(sent_frame(False, f"ASR: {err}"[:36]))
+        print(f"[ASR] failed: {err}", flush=True)
+        return
+    if not text:
+        ble.send(asr_frame(False, "No speech detected"))
+        ble.send(sent_frame(False, "No speech detected"))
+        return
+    print(f"[ASR] {text}", flush=True)
+
+    # 留着给确认屏用：用户可能半小时后才按 OK
+    ble.pending_text = text
+    ble.pending_idx = idx
+
+    if mode == SEND_CONFIRM:
+        ble.send(asr_frame(True, text))
+        print(f"[ASR] echoed to device ({len(text)} chars), awaiting OK",
+              flush=True)
+        return
+
+    ble.pending_text = ""
+    _deliver(ble, idx, text)
+
+
+def handle_confirm(ble: BleCenter, idx: int):
+    """工牌在确认屏上按了 OK：投递刚才缓存的那份转写。"""
+    text = ble.pending_text
+    if not text:
+        ble.send(sent_frame(False, "Nothing to send"))
+        print("[CONFIRM] no pending transcript", flush=True)
+        return
+    ble.pending_text = ""
+    if idx < 0:
+        idx = ble.pending_idx
+    print(f"[CONFIRM] accepted idx={idx}", flush=True)
+    _deliver(ble, idx, text)
+
+
+# ===========================================================================
+# 主循环
+# ===========================================================================
+
+_BLE = None
+
+
+def main():
+    global _BLE
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 先在主线程把 ASR 加载完，再拉 BLE / HTTP 线程。
+    # 踩过的坑：在子线程里 load ctranslate2 的模型，会在一个已经有多线程
+    # （bleak 的 WinRT 线程 + HTTP 线程）的进程里 access violation ——
+    # faulthandler 抓到的栈就是 WhisperModel.__init__ -> ctranslate2.models.Whisper。
+    # 主线程加载则一直稳定，代价只是启动多等 ~1.4s。
+    if _hf_cached(WHISPER_MODEL):
+        t0 = time.time()
+        if get_whisper() is not None:
+            print(f"[ASR] warm-up {time.time() - t0:.1f}s（主线程）", flush=True)
+    else:
+        print("[ASR] 权重未缓存：首次「录音->发送」时会先下载再加载", flush=True)
+
+    threading.Thread(target=run_http, daemon=True).start()
+    ble = BleCenter()
+    _BLE = ble
+    ble.start()
+    threading.Thread(target=bridge_worker, args=(ble,), daemon=True).start()
+
+    print("wb-bridge v3 启动（双向）", flush=True)
+    print(f"  心跳   : {SESSIONS_DIR}", flush=True)
+    print(f"  数据库 : {WORKBUDDY_DB}", flush=True)
+    print(f"  消息   : {PROJECTS_DIR}", flush=True)
+    print(f"  语音   : {VOICE_DIR}", flush=True)
+    print(f"  BLE    : {'就绪' if ble.available else '不可用 - ' + str(ble.last_error)}",
+          flush=True)
+    print(f"  ASR    : faster-whisper/{WHISPER_MODEL} "
+          f"cached={_hf_cached(WHISPER_MODEL)}", flush=True)
+    print(flush=True)
+    print(f"  HTTP   : http://127.0.0.1:{HTTP_PORT}/", flush=True)
+    print("    /status /conversations /messages?id= /usage /health /ble /voice",
+          flush=True)
+    print("    /gw   网关状态（端口/密钥/缓存）", flush=True)
+    print("    /send?text=&conv=&sender=   直接发一条（跳过 ASR，诊断用）",
+          flush=True)
+    print("    /push 手动全量下发", flush=True)
+    print(flush=True)
+
+    try:
+        while True:
+            ts = datetime.now().strftime("%H:%M:%S")
+            if ble.connected:
+                print(f"[{ts}] BLE {ble.peer} mtu={ble.mtu} "
+                      f"pushed={ble.pushed} recv={ble.received}", flush=True)
+            else:
+                st = compute_state()
+                print(f"[{ts}] {NAME_OF[st['state']]:8s} "
+                      f"task={(st['task'] or '-')[:28]}", flush=True)
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        print("\n已退出")
+
+
+if __name__ == "__main__":
+    main()
