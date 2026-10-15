@@ -29,6 +29,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,7 +38,7 @@ import urllib.request
 import uuid
 import wave
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -45,7 +46,24 @@ from urllib.parse import urlparse, parse_qs
 # 配置
 # ---------------------------------------------------------------------------
 
-WB_HOME      = Path(os.environ.get("USERPROFILE", "~")) / ".workbuddy"
+def _wb_home() -> Path:
+    """定位 ~/.workbuddy。
+
+    注意：`Path("~")` **不会**展开成家目录。原实现写的是
+        Path(os.environ.get("USERPROFILE", "~")) / ".workbuddy"
+    Windows 上正常（USERPROFILE 一定存在），但在 macOS / Linux 上会退化成
+    字面量相对路径 "~/.workbuddy" —— 于是所有数据源都查不到东西，
+    只读功能静默返回空，看起来像"服务跑起来了但什么都没数据"。
+    """
+    env = os.environ.get("WB_HOME")
+    if env:
+        return Path(env).expanduser()
+    # Windows 用 USERPROFILE；macOS / Linux 用真实家目录
+    base = os.environ.get("USERPROFILE")
+    return (Path(base) if base else Path.home()) / ".workbuddy"
+
+
+WB_HOME      = _wb_home()
 SESSIONS_DIR = WB_HOME / "sessions"
 WORKBUDDY_DB = WB_HOME / "workbuddy.db"
 PROJECTS_DIR = WB_HOME / "projects"
@@ -65,17 +83,31 @@ LIST_MAX      = 5         # 下发给工牌的对话条数；屏幕一屏 5 行�
 MSG_PAGE_MAX  = 10        # 固件 MSG_SLOTS
 MSG_BODY_MAX  = 120       # WB_TEXT_LEN
 ASR_BODY_MAX  = 170       # 转写回显 ≤ WB_ASR_LEN(200)，留帧头 + UTF-8 余量
-VOICE_MAX_SEC = 60        # 语音上限，防呆
+VOICE_MAX_SEC = 60        # 语音上限，防呆（固件侧同样有独立上限）
+
+# 语音 WAV 保留策略：每次录音落一个文件，不清理会一直堆
+VOICE_KEEP_MAX = 200      # 最多保留多少个
+VOICE_KEEP_DAYS = 30      # 或者最多保留多少天
+
+# 转写全文会进日志。默认只打长度，设 WB_LOG_ASR=1 才打全文。
+LOG_ASR_TEXT = os.environ.get("WB_LOG_ASR", "0") not in ("", "0", "false", "False")
 
 # WorkBuddy 本地 CLI —— **兜底路径**。
 # 正常发送走下面的网关 REST（见 _discover / send_to_workbuddy）；只有在网关
 # 发现失败时才退回 CLI 子进程，而那条路在独立进程里拿不到登录态，基本不可用。
 # 两个路径都可以用环境变量覆盖。
-_LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA")
-                     or (Path.home() / "AppData" / "Local"))
-CLI_DIR  = Path(os.environ.get("WB_CLI_DIR")
-                or (_LOCALAPPDATA / "Programs" / "WorkBuddy" / "resources"
-                    / "app.asar.unpacked" / "cli"))
+def _default_cli_dir() -> Path:
+    """WorkBuddy 随包 CLI 的默认位置（按平台取）。"""
+    if sys.platform == "darwin":
+        return Path("/Applications/WorkBuddy.app/Contents/Resources"
+                    "/app.asar.unpacked/cli")
+    local = os.environ.get("LOCALAPPDATA")
+    base = Path(local) if local else (Path.home() / "AppData" / "Local")
+    return (base / "Programs" / "WorkBuddy" / "resources"
+            / "app.asar.unpacked" / "cli")
+
+
+CLI_DIR  = Path(os.environ.get("WB_CLI_DIR") or _default_cli_dir())
 
 
 def _find_node():
@@ -85,10 +117,13 @@ def _find_node():
         return Path(env)
     versions = Path.home() / ".workbuddy" / "binaries" / "node" / "versions"
     if versions.is_dir():
-        found = sorted(versions.glob("*/node.exe"))
+        # Windows 装的是 node.exe，macOS / Linux 是 bin/node
+        found = sorted(versions.glob("*/node.exe")) or \
+            sorted(versions.glob("*/bin/node"))
         if found:
             return found[-1]
-    return Path("node")
+    from shutil import which
+    return Path(which("node") or "node")
 
 
 NODE_EXE = _find_node()
@@ -269,23 +304,66 @@ def latest_heartbeat():
 # ===========================================================================
 
 def _read_db():
+    """开一个只读连接。
+
+    优先直连只读 URI —— SQLite 本身支持多进程只读并发，不需要拷贝文件。
+    原实现是反的：先 `shutil.copy2` 把整个库拷到临时目录，只在拷贝失败时
+    才退到只读 URI。而 `_build_all_frames()` 一轮要调它 3 次（状态/列表/额度），
+    主循环 2 秒一轮 —— 稳态下每秒约 1.5 次整库拷贝，纯属无谓磁盘 IO。
+    """
     if not WORKBUDDY_DB.exists():
         return None
+    try:
+        con = sqlite3.connect(f"file:{WORKBUDDY_DB}?mode=ro", uri=True,
+                              timeout=1.0)
+        con.execute("SELECT 1").fetchone()      # 确认连接真的可用
+        return con
+    except sqlite3.Error:
+        pass
+    # 只读 URI 走不通（Windows 上偶发文件锁）才退回快照拷贝
     tmp = Path(tempfile.gettempdir()) / "wb_bridge_snapshot.db"
     try:
         shutil.copy2(WORKBUDDY_DB, tmp)
     except (OSError, PermissionError):
-        try:
-            return sqlite3.connect(f"file:{WORKBUDDY_DB}?mode=ro", uri=True, timeout=1.0)
-        except sqlite3.Error:
-            return None
+        return None
     try:
         return sqlite3.connect(str(tmp))
     except sqlite3.Error:
         return None
 
 
+# ---------------------------------------------------------------------------
+# 查询结果短缓存
+# ---------------------------------------------------------------------------
+# 一次 _build_all_frames() 会调 compute_state() + list_conversations() +
+# get_usage()，而 compute_state() 内部又会调 get_running_conversation() 和
+# get_usage()。缓存 1 秒刚够同一轮复用，又不会让屏幕上的数据变旧
+# （推帧间隔本来就是 2 秒）。
+
+_QUERY_CACHE: dict = {}
+_QUERY_TTL = 1.0
+_query_lock = threading.Lock()
+
+
+def _cached(key, producer):
+    now = time.monotonic()
+    with _query_lock:
+        hit = _QUERY_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    val = producer()
+    with _query_lock:
+        _QUERY_CACHE[key] = (now + _QUERY_TTL, val)
+    return val
+
+
 def list_conversations(limit=LIST_MAX, offset=0):
+    # 返回浅拷贝：调用方（BleCenter.convs）会长期持有，别让缓存对象被改
+    return list(_cached(("convs", limit, offset),
+                        lambda: _query_conversations(limit, offset)))
+
+
+def _query_conversations(limit, offset):
     con = _read_db()
     if con is None:
         return []
@@ -736,20 +814,59 @@ def _discover(force=False):
         return None, None
 
 
-def gateway_active_session():
-    """当前 GUI 活跃会话 id。
+_GW_ACTIVE = {"sid": None, "at": 0.0}
+_GW_ACTIVE_TTL = 10.0          # 网关活跃会话的短缓存（秒）
 
-    注意：要走认证端点，**会消耗网关配额**，只用于诊断，别放进热路径。
+
+def gateway_active_session():
+    """当前 GUI 活跃会话 id（带 10s TTL 缓存）。
+
+    该端点要消耗网关配额。一次发送本来只调一次不算热路径，但历史上
+    `_pick_target_session` 的多条路径会重复调它，加上缓存兜底防抖。
+    本机实测较新网关的 /status 不返回 activeSessionId（只有
+    status/busy/lastCompletedAt），所以 None 是常态，不是故障。
     """
+    now = time.monotonic()
+    if now - _GW_ACTIVE["at"] < _GW_ACTIVE_TTL:
+        return _GW_ACTIVE["sid"]
+    sid = None
     base, pw = _discover()
-    if not base:
-        return None
-    try:
-        import gw_discover
-        st = gw_discover.probe_gateway(base, pw) or {}
-        return st.get("activeSessionId")
-    except Exception:                                 # noqa: BLE001
-        return None
+    if base:
+        try:
+            import gw_discover
+            st = gw_discover.probe_gateway(base, pw) or {}
+            sid = st.get("activeSessionId")
+        except Exception:                             # noqa: BLE001
+            sid = None
+    _GW_ACTIVE.update(sid=sid, at=now)
+    return sid
+
+
+_GW_SESS_CACHE = {"rows": None, "at": 0.0}
+_GW_SESS_TTL = 5.0
+
+
+def gateway_sessions(limit=10):
+    """从网关读会话列表（比翻 sqlite 更准，含 GUI 刚建的会话）。带 5s 缓存。"""
+    now = time.monotonic()
+    if now - _GW_SESS_CACHE["at"] < _GW_SESS_TTL:
+        rows = _GW_SESS_CACHE["rows"] or []
+        return rows[:limit]
+    rows = []
+    base, pw = _discover()
+    if base:
+        req = urllib.request.Request(
+            f"{base}/api/v1/sessions",
+            headers={"Authorization": f"Bearer {pw}",
+                     "X-CodeBuddy-Request": "1"})
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                body = json.loads(r.read().decode("utf-8", "replace"))
+            rows = ((body or {}).get("data") or {}).get("sessions") or []
+        except Exception:                             # noqa: BLE001
+            rows = []
+    _GW_SESS_CACHE.update(rows=rows, at=now)
+    return rows[:limit]
 
 
 def gateway_sessions(limit=10):
@@ -1020,7 +1137,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def run_http():
-    srv = HTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
+    # ThreadingHTTPServer：/send 内部有最长 ~7.5s 的退避重试，单线程
+    # HTTPServer 会让诊断请求排队堵死（浏览器 tab 卡住表现为一直转圈）。
+    srv = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
+    srv.daemon_threads = True
     srv.serve_forever()
 
 
@@ -1057,6 +1177,7 @@ class BleCenter(threading.Thread):
         self.voice_codec = VOICE_CODEC_PCM16
         self.voice_last_seq = None
         self.voice_lost = 0
+        self.voice_truncated = False     # 达到 VOICE_MAX_SEC 被静默截断过
         self._vbuf_lock = threading.Lock()
 
         # 已转写但还没投递的文本（工牌确认屏用的那份）
@@ -1142,6 +1263,11 @@ class BleCenter(threading.Thread):
                 self.voice_last_seq = seq
                 if len(self.voice_buf) < VOICE_MAX_SEC * self.voice_rate * 2:
                     self.voice_buf += pcm
+                else:
+                    # 固件侧没有时长上限（设备屏上照常计时），PC 侧到点就
+                    # 不再收包 —— 必须把"截断"显式告诉用户，否则他会以为
+                    # 是 Whisper 转写不准弄丢了后半段。
+                    self.voice_truncated = True
             return
 
         self.rx_queue.put((cmd, pl))
@@ -1221,75 +1347,99 @@ class BleCenter(threading.Thread):
 def bridge_worker(ble: BleCenter):
     while True:
         cmd, pl = ble.rx_queue.get()
+        # 整个 worker 包一层兜底：任何一条事件处理抛异常（numpy 缺失、
+        # 数组越界、写盘失败……）都不能让线程死掉 —— 死了之后所有按键/
+        # 录音/发送永久失效，而 /ble 还报 connected=true，极难排查。
+        try:
+            _dispatch(ble, cmd, pl)
+        except Exception:                         # noqa: BLE001
+            import traceback
+            print(f"[RX] handler error cmd=0x{cmd:02x}:", flush=True)
+            traceback.print_exc()
 
-        if cmd == U_REQ:
-            what = pl[0] if len(pl) >= 1 else REQ_ALL
-            page = pl[1] if len(pl) >= 2 else 0
-            print(f"[RX] req what={what} page={page}", flush=True)
-            if what in (REQ_ALL, REQ_LIST):
-                ble.push_all()
-            elif what == REQ_MSG:
-                ble.msg_page = page
-                for f in ble._build_msg_frames(page):
-                    ble.send(f)
-            elif what == REQ_USAGE:
-                st = compute_state()
-                u = get_usage(st.get("conv_id"))
-                ble.send(usage_frame(round(u["used"] * 10), round(u["size"] * 10)))
 
-        elif cmd == U_SELECT:
-            if len(pl) >= 1:
-                ble.selected = pl[0]
-                print(f"[RX] select conv={ble.selected}", flush=True)
+def _dispatch(ble: BleCenter, cmd: int, pl: bytes):
+    if cmd == U_REQ:
+        what = pl[0] if len(pl) >= 1 else REQ_ALL
+        page = pl[1] if len(pl) >= 2 else 0
+        print(f"[RX] req what={what} page={page}", flush=True)
+        if what in (REQ_ALL, REQ_LIST):
+            ble.push_all()
+        elif what == REQ_MSG:
+            ble.msg_page = page
+            for f in ble._build_msg_frames(page):
+                ble.send(f)
+        elif what == REQ_USAGE:
+            st = compute_state()
+            u = get_usage(st.get("conv_id"))
+            ble.send(usage_frame(round(u["used"] * 10), round(u["size"] * 10)))
 
-        elif cmd == U_VOICE_START:
-            with ble._vbuf_lock:
-                ble.voice_buf = bytearray()
-            ble.voice_rate = (pl[0] | (pl[1] << 8)) if len(pl) >= 2 else 8000
-            ble.voice_codec = pl[2] if len(pl) >= 3 else VOICE_CODEC_PCM16
-            ble.voice_last_seq = None
-            ble.voice_lost = 0
-            print(f"[RX] voice start @{ble.voice_rate}Hz "
-                  f"codec={'ADPCM' if ble.voice_codec else 'PCM16'}", flush=True)
+    elif cmd == U_SELECT:
+        if len(pl) >= 1:
+            ble.selected = pl[0]
+            print(f"[RX] select conv={ble.selected}", flush=True)
 
-        elif cmd == U_VOICE_END:
-            with ble._vbuf_lock:
-                n = len(ble.voice_buf)
-            print(f"[RX] voice end, {n} bytes, seq_lost={ble.voice_lost}",
-                  flush=True)
+    elif cmd == U_VOICE_START:
+        with ble._vbuf_lock:
+            ble.voice_buf = bytearray()
+        ble.voice_rate = (pl[0] | (pl[1] << 8)) if len(pl) >= 2 else 8000
+        ble.voice_codec = pl[2] if len(pl) >= 3 else VOICE_CODEC_PCM16
+        ble.voice_last_seq = None
+        ble.voice_lost = 0
+        ble.voice_truncated = False
+        print(f"[RX] voice start @{ble.voice_rate}Hz "
+              f"codec={'ADPCM' if ble.voice_codec else 'PCM16'}", flush=True)
 
-        elif cmd == U_VOICE_ABORT:
-            with ble._vbuf_lock:
-                ble.voice_buf = bytearray()
-            print("[RX] voice abort", flush=True)
+    elif cmd == U_VOICE_END:
+        with ble._vbuf_lock:
+            n = len(ble.voice_buf)
+        tag = " (TRUNCATED@%ds)" % VOICE_MAX_SEC if ble.voice_truncated else ""
+        print(f"[RX] voice end, {n} bytes, seq_lost={ble.voice_lost}{tag}",
+              flush=True)
 
-        elif cmd == U_SEND:
-            idx = pl[0] if len(pl) >= 1 else ble.selected
-            mode = pl[1] if len(pl) >= 2 else SEND_AUTO
-            handle_voice_send(ble, idx, mode)
+    elif cmd == U_VOICE_ABORT:
+        with ble._vbuf_lock:
+            ble.voice_buf = bytearray()
+        print("[RX] voice abort", flush=True)
 
-        elif cmd == U_CONFIRM:
-            idx = pl[0] if pl else ble.selected
-            handle_confirm(ble, idx)
+    elif cmd == U_SEND:
+        idx = pl[0] if len(pl) >= 1 else ble.selected
+        mode = pl[1] if len(pl) >= 2 else SEND_AUTO
+        handle_voice_send(ble, idx, mode)
 
-        elif cmd == U_KEY:
-            pass  # 诊断用，忽略
+    elif cmd == U_CONFIRM:
+        idx = pl[0] if pl else ble.selected
+        handle_confirm(ble, idx)
+
+    elif cmd == U_KEY:
+        pass  # 诊断用，忽略
 
 
 def _pick_target_session(ble: BleCenter, idx: int):
     """决定这句话投到哪个对话，返回 (session_id, 来源标签)。
 
-    优先用网关的**活跃会话**，也就是 WorkBuddy 窗口里此刻开着的那一个。
+    投给"WorkBuddy 窗口里此刻开着的那一个"，GUI 才会有反应 —— 之前直接用
+    ble.convs[idx] 的 id，投递确实成功、文件里也落了字，但 GUI 不会因为一条
+    外部消息切过去，就成了"工牌显示 SENT，电脑却像没反应"。
 
-    之前直接用 ble.convs[idx] 的 id（PC 数据库里的会话 id），投递确实成功了、
-    会话文件里也落了字，但 GUI 不会因为一条外部消息就切过去，用户眼前的窗口
-    毫无变化 —— 于是就成了"工牌显示 SENT，电脑却像没反应"。
-
-    设备端列表从此只当"浏览入口"用；真正投递一律跟着 GUI 走。
+    解析顺序（从免费到收费）：
+      1. 网关 /api/v1/sessions 里 isCurrent==true 的会话（一次认证请求，5s 缓存）
+      2. 网关 /status 的 activeSessionId（老网关才有；10s 缓存，多数返回 None）
+      3. 本地心跳文件 ~/.workbuddy/sessions/*.json 里最新心跳的 sessionId
+         —— 零网络请求、零配额，GUI 心跳 5s 一跳，实测最可靠
+      4. 设备选中的 conv id（最后兜底，可能"SENT 但窗口没反应"）
     """
+    for s in gateway_sessions(5):
+        if s.get("isCurrent"):
+            sid = s.get("id") or s.get("sessionId")
+            if sid:
+                return str(sid), "current"
     active = gateway_active_session()
     if active:
-        return active, "active"
+        return str(active), "active"
+    hb_at, _cwd, hb_sid = latest_heartbeat()
+    if hb_sid and hb_at and (time.time() * 1000 - hb_at) < 15_000:
+        return str(hb_sid), "heartbeat"
     if 0 <= idx < len(ble.convs):
         return ble.convs[idx]["id"], "device"
     if ble.convs:
@@ -1344,14 +1494,18 @@ def handle_voice_send(ble: BleCenter, idx: int, mode: int = SEND_AUTO):
         ble.send(sent_frame(False, "No speech detected"))
         return
     print(f"[ASR] {text}", flush=True)
+    if ble.voice_truncated:
+        print(f"[VOICE] 注意：录音超过 {VOICE_MAX_SEC}s，已截断", flush=True)
 
     # 留着给确认屏用：用户可能半小时后才按 OK
     ble.pending_text = text
     ble.pending_idx = idx
 
     if mode == SEND_CONFIRM:
-        ble.send(asr_frame(True, text))
-        print(f"[ASR] echoed to device ({len(text)} chars), awaiting OK",
+        echo = (f"截断@{VOICE_MAX_SEC}s！{text}" if ble.voice_truncated
+                else text)
+        ble.send(asr_frame(True, echo))
+        print(f"[ASR] echoed to device ({len(echo)} chars), awaiting OK",
               flush=True)
         return
 

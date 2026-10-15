@@ -84,6 +84,7 @@ typedef enum {
 static wb_page_t s_page = PAGE_HOME;
 static uint8_t   s_bright_idx;
 static bool      s_dimmed;
+static bool      s_off;              // 已全灭：守卫位，避免每个 tick 重复写背光寄存器
 static uint32_t  s_last_active;
 
 static wb_status_t s_st;
@@ -158,7 +159,11 @@ static uint32_t now_ms(void)
 static void mark_active(void)
 {
     s_last_active = now_ms();
-    if (s_dimmed) {
+    if (s_off) {
+        s_off = false;
+        s_dimmed = false;
+        bsp_display_backlight(BRIGHT[s_bright_idx]);
+    } else if (s_dimmed) {
         s_dimmed = false;
         bsp_display_backlight(BRIGHT[s_bright_idx]);
     }
@@ -288,7 +293,9 @@ static void home_build(void)
     s_h_task = label_new(run, "--", &lv_font_wb_16, C_TEXT);
     lv_obj_set_pos(s_h_task, 10, 26);
     lv_obj_set_width(s_h_task, SCR_W - 40);
-    lv_label_set_long_mode(s_h_task, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    // DOT：任务名超长显示省略号。原来 SCROLL_CIRCULAR 常驻滚动动画
+    // 每帧都要重绘整行 —— 无 PSRAM 的 C3 上这是无谓的 CPU/帧预算消耗。
+    lv_label_set_long_mode(s_h_task, LV_LABEL_LONG_DOT);
 
     s_h_model = label_new(run, "--", &lv_font_montserrat_12, C_ACCENT);
     lv_obj_set_pos(s_h_model, 10, 52);
@@ -668,8 +675,8 @@ static void record_paint_bars(void)
 {
     for (int i = 0; i < BAR_COUNT; i++) {
         lv_obj_set_height(s_r_bar[i], 4);
-        lv_obj_set_y(s_r_bar[i], 84);
-    }
+        lv_obj_set_y(s_r_bar[i], 94);      // 与 record_tick 的基线公式一致
+    }                                      // （原来写 84，首帧后整体跳 10px）
 }
 
 static void record_tick(void)
@@ -861,6 +868,12 @@ static void tick_cb(lv_timer_t *t)
 
     // 录音页：转写回显 / 发送结果
     if (s_page == PAGE_RECORD && s_rec) {
+        // 固件侧 60s 上限到点，voice 任务自己推了 VOICE_END 并退出 ——
+        // 但那样只停了录音，U_SEND 不会发出，PC 永远不会转写，屏幕会
+        // 永远停在 RECORDING。这里检测到任务已停就走正常收尾流程。
+        if (s_rec_state == REC_RECORDING && !wb_voice_active()) {
+            record_finish();
+        }
         // 转写文本先到 —— 这一帧把屏幕切进 CONFIRM 态
         bool aok;
         char asr[WB_ASR_LEN + 1];
@@ -892,11 +905,15 @@ static void tick_cb(lv_timer_t *t)
 
     // 息屏
     uint32_t idle = now_ms() - s_last_active;
-    if (!s_dimmed && idle > IDLE_DIM_MS) {
+    if (!s_dimmed && !s_off && idle > IDLE_DIM_MS) {
         s_dimmed = true;
         bsp_display_backlight(BRIGHT[2]);
     }
-    if (idle > IDLE_OFF_MS) {
+    // 只做一次：背光 0 是 I2C 写，每 tick 重复写纯属浪费（还可能在
+    // 某些面板上引起闪一下）。重新点亮统一走 mark_active() 的 s_off 分支。
+    if (!s_off && idle > IDLE_OFF_MS) {
+        s_off = true;
+        s_dimmed = false;
         bsp_display_backlight(0);
     }
 }

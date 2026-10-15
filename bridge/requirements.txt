@@ -1,5 +1,7 @@
 # wb-bridge 运行依赖
 #   pip install -r requirements.txt
+# 实测通过版本（macOS + Windows）：bleak 0.22.x / numpy 2.x /
+# faster-whisper 1.2.x / ctranslate2 4.5.x。只约束下限，锁死请自行 pip freeze。
 
 # --- 必需 ---
 bleak>=0.22            # BLE 主机端（Windows 走 WinRT）

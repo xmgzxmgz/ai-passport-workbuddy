@@ -26,6 +26,7 @@ static const char *TAG = "wb_voice";
 #define ADPCM_LEN    (PACK_SAMPLES / 2)         // 160 字节
 #define PKT_LEN      (2 + 2 + ADPCM_LEN)        // seq16 + seed16 + nibbles
 #define TASK_STACK   6144                       // 含 codec 建链 + 264B 推送栈帧
+#define VOICE_MAX_MS (60u * 1000u)              // 固件侧录音上限：到点自动 END
 
 static TaskHandle_t      s_task;
 static volatile bool     s_run;
@@ -85,6 +86,14 @@ static void voice_task(void *arg)
         s_level = lv > 15 ? 15 : (uint8_t)lv;
         s_samples += BUF_SAMPLES;
 
+        // 固件侧时长上限：之前只靠 PC 侧静默截断，用户说 90 秒屏幕照常
+        // 计时，PC 只收前 60 秒，转写缺尾巴还以为是 Whisper 不准。
+        // 到点直接跳出循环，走下面的正常 VOICE_END 收尾。
+        if (s_samples >= (uint32_t)(VOICE_MAX_MS * WB_VOICE_RATE / 1000u)) {
+            ESP_LOGI(TAG, "hit %us cap, stopping", (unsigned)(VOICE_MAX_MS / 1000u));
+            break;
+        }
+
         memcpy(&acc[acc_n], blk, sizeof(blk));
         acc_n += BUF_SAMPLES;
         if (acc_n < PACK_SAMPLES) continue;
@@ -133,7 +142,12 @@ out:
 
 esp_err_t wb_voice_start(void)
 {
-    if (s_task) return ESP_OK;                 // 已在录
+    // 上一次录音的任务还没退干净（正常已被 stop 等待，这里只是兜底）。
+    // 原来此处直接 return ESP_OK 假装成功，调用方以为在录，实际什么都没发生。
+    if (s_task) {
+        wb_voice_stop();                       // 内部会等最多 500ms
+        if (s_task) return ESP_ERR_INVALID_STATE;
+    }
 
     s_run = true;
     s_active = true;
@@ -154,6 +168,15 @@ esp_err_t wb_voice_start(void)
 void wb_voice_stop(void)
 {
     s_run = false;
+    // 等旧任务真正退出再返回。之前的竞态：UP 取消后旧任务还阻塞在
+    // bsp_audio_read()，立刻按 OK 重录时 s_task 非空 -> start 直接返回
+    // "已在录"，但实际没起新任务 —— 屏幕进 RECORDING 却无波形无计时，
+    // 最后判 TOO SHORT。任务循环 20ms 一轮，正常 2~3 轮内退出。
+    int wait_ms = 0;
+    while (s_task != NULL && wait_ms < 500) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_ms += 10;
+    }
 }
 
 bool wb_voice_active(void)

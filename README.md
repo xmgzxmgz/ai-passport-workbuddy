@@ -259,11 +259,14 @@ GET  /api/v1/runs/:id/stream   SSE 读结果
 
 认证用的密钥由 GUI 进程**随机生成、只通过环境变量注入子进程、不落盘**。所以直连 CLI 会卡在 `AuthenticationRequiredError`。
 
-这里的做法是（`bridge/gw_discover.py`）：
-1. 用 Windows PEB 遍历读活进程的环境块，取出 `CODEBUDDY_GATEWAY_PASSWORD`；
+这里的做法是（`bridge/gw_discover.py`，跨平台）：
+1. 读活进程的环境块，取出 `CODEBUDDY_GATEWAY_PASSWORD`：
+   - **Windows**：PEB 遍历（NtQueryInformationProcess，无需其他依赖）；
+   - **macOS**：`ps -Eww -p <pid>`（同用户进程免 root 可读）；
+   - **Linux**：`/proc/<pid>/environ`（同用户可读）。
 2. 无认证并发扫本地端口，靠**唯一返回 401 `AUTH_REQUIRED`** 的特征认出网关（不会消耗配额）。
 
-冷发现 ~2.7s，有缓存后 ~1.1s。密钥只在内存里，不写盘。
+冷发现 ~1.5s，有缓存后 ~0.1s。密钥只在内存里，不写盘（端口/密钥缓存文件含密钥，权限 0600，路径见 `.gw_cache.json`）。
 
 ⚠️ 另外：网关按 `sender.id` 做限流分桶（`maxPerMinute=60`、`maxConcurrent=3`）。多设备共用一个桶很容易撞 429，所以服务按 BLE 地址派生了独立的 sender id。
 
@@ -271,7 +274,7 @@ GET  /api/v1/runs/:id/stream   SSE 读结果
 
 消息确实发出去、也落库了，但 **WorkBuddy 窗口不会因为收到一条外部消息就切过去** —— 你眼前的界面毫无变化，看起来就像失败。
 
-修法是投递目标改成网关的 `activeSessionId`（也就是 GUI 正开着的那个会话），设备上的列表退化成纯浏览入口。
+修法是投递目标按优先级解析（`_pick_target_session`）：网关 `isCurrent` 会话 → `activeSessionId` → **本地心跳文件里最新活跃会话**（零配额）→ 设备选中项兜底。设备上的列表退化成纯浏览入口。
 
 ---
 
@@ -280,7 +283,7 @@ GET  /api/v1/runs/:id/stream   SSE 读结果
 - **ASR 精度**：8kHz + 4bit ADPCM 的链路本身就丢了不少高频（中文擦音尤其吃亏），叠加 `small` 模型时短句容易糊。**换 `medium` / `large-v3` + CUDA 能明显改善**，这是目前性价比最高的提升手段。
 - **麦克风增益偏高**：实测 `peak=32768`、有削顶。凑近说话可用，远场会明显劣化。
 - **单设备**：中转服务同一时刻只服务一台工牌。
-- **Windows 优先**：网关发现依赖 Windows PEB 读取，这套在 macOS / Linux 上不成立（其余功能不受影响）。
+- **Windows / macOS / Linux 均可**：网关发现已跨平台（Windows PEB 遍历、macOS `ps -Eww`、Linux `/proc/environ`）。Windows 端功能最全（原始开发平台）；macOS 上只读功能与发送均已实测可用。
 
 ---
 
