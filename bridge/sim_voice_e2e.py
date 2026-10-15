@@ -62,12 +62,22 @@ def main() -> int:
               flush=True)
         return 1
 
-    # ---- 2. 路由 ----
-    route = w._route_to_instance(sid, force=True)
-    print(f"[sim] 2/4 路由 : {route[0] or '(未命中)'}", flush=True)
-    if not route[0]:
-        print("[sim] 路由失败 —— 目标会话没有任何可用网关", flush=True)
+    # ---- 2. 路由（只作展示；投递时 deliver_text 会自己重算并逐个试）----
+    try:
+        import gw_discover
+        cands = gw_discover.deliver_candidates(sid, force=True, verbose=True)
+    except Exception as e:                                # noqa: BLE001
+        cands = []
+        print(f"[sim] 候选发现异常: {type(e).__name__}: {e}", flush=True)
+    print(f"[sim] 2/4 路由 : 共 {len(cands)} 个候选", flush=True)
+    for c in cands[:4]:
+        print(f"[sim]         {c['base']} score={c['score']} [{c['why']}]",
+              flush=True)
+    if not cands:
+        print("[sim] 一个网关实例都没发现 —— 确认 WorkBuddy 正在运行",
+              flush=True)
         return 1
+    route = (cands[0]["base"], cands[0]["password"])
 
     # ---- 3. 投递 + 回读验真（deliver_text 内含等空闲/重试/验真）----
     busy = None

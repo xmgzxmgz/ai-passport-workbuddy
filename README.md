@@ -216,7 +216,9 @@ python wb_bridge.py
 | `/conversations` | 对话列表 |
 | `/messages?id=<sid>` | 指定会话的消息 |
 | `/usage` | 额度用量 |
-| `/send?text=&conv=&sender=` | **跳过 ASR 直接发一条**（诊断用） |
+| `/send?text=&conv=&sender=&wait=` | **跳过 ASR 直接发一条**（走完整投递链路 + 落库验真） |
+| `/route?sid=<会话id>` | **投递路由诊断**：这个会话会被投到哪个实例、凭什么这么判 |
+| `/sim?text=&idx=` | **走工牌同一条链路**投递（含等空闲/重试/回执），用于不开麦克风验收 |
 | `/push` | 手动全量下发一次 |
 
 ---
@@ -250,11 +252,15 @@ BLE 实测约 **10 KB/s**，而 8kHz / 16bit 单声道 PCM 要 **16 KB/s** —�
 
 ### 4. 怎么把消息"发进" WorkBuddy
 
-WorkBuddy 桌面端自带一个本地 HTTP 网关（就是 `codebuddy --serve` 那套）：
+WorkBuddy 桌面端自带一个本地 HTTP 网关（就是 `codebuddy --serve` 那套）。**每个窗口一个实例，端口随机**：
 
 ```
-POST /api/v1/runs     发起一次 Agent 运行
-GET  /api/v1/runs/:id/stream   SSE 读结果
+POST /api/v1/sessions/{id}/reply   向"该实例当前装载的会话"投递一条用户消息
+POST /api/v1/runs                  发起一次后台 Agent 运行（没有 sessionId 参数）
+GET  /api/v1/sessions/live         该实例当前 live 会话 {sessionId, writerOccupied}
+GET  /api/v1/sessions              该实例工作目录下的会话列表
+GET  /api/v1/status                该实例运行状态 {busy, runStatus, activeSessionId}
+GET  /api/v1/info                  该实例信息（**含 cwd**，实例身份的硬标识）
 ```
 
 认证用的密钥由 GUI 进程**随机生成、只通过环境变量注入子进程、不落盘**。所以直连 CLI 会卡在 `AuthenticationRequiredError`。
@@ -268,13 +274,57 @@ GET  /api/v1/runs/:id/stream   SSE 读结果
 
 冷发现 ~1.5s，有缓存后 ~0.1s。密钥只在内存里，不写盘（端口/密钥缓存文件含密钥，权限 0600，路径见 `.gw_cache.json`）。
 
-⚠️ 另外：网关按 `sender.id` 做限流分桶（`maxPerMinute=60`、`maxConcurrent=3`）。多设备共用一个桶很容易撞 429，所以服务按 BLE 地址派生了独立的 sender id。
+⚠️ 限流说明：网关的令牌桶（2 次/分、12 次/时）**只对认证失败计数**（防爆破），成功的认证请求不消耗配额 —— 所以"挨个实例试一遍"不会把自己限流死。
 
-### 5. "显示 SENT，电脑却没反应"
+### 5. "显示 SENT，电脑却没反应" —— 投递为什么这么难
 
-消息确实发出去、也落库了，但 **WorkBuddy 窗口不会因为收到一条外部消息就切过去** —— 你眼前的界面毫无变化，看起来就像失败。
+这条链路上有两个互相独立的坑，都踩过：
 
-修法是投递目标按优先级解析（`_pick_target_session`）：网关 `isCurrent` 会话 → `activeSessionId` → **本地心跳文件里最新活跃会话**（零配额）→ 设备选中项兜底。设备上的列表退化成纯浏览入口。
+**坑一：reply 只服务"它自己装载着的那一个会话"。**
+
+逆向网关源码（`app.asar` 内嵌 OpenAPI + sessions 控制器）拿到的权威语义：
+
+```js
+async replySession(id, body) {
+  const cur = this.sessionManager.sessionSubject.value;   // 本实例装载的会话
+  if (!canDeliverFollowReply(cur?.id, id) || !cur)        // 即 cur.id === id
+     409 SESSION_FOLLOW_NOT_LIVE;
+  await this.agentService.runDefault(buildFollowReplyItems(text, cur.id), ...);
+}
+```
+
+发到别的实例一律 409。**好消息是 409 很干净** —— 消息不会落到任何别的地方。所以"挨个实例试 + 看谁受理"是安全且完备的策略。
+
+**坑二：会话正在跑 run 时，reply 返回 `delivered:true` 但消息被静默丢弃。**
+
+所以只信回执必然吞掉假成功。必须投完**回读会话记录（`projects/*/<sid>.jsonl`）验真**，只认新增的 `type=message & role=user` 行。
+
+**为什么以前十投九败**：老的解析链是 `live → owner → 心跳`，全是**运行时状态**，而工牌按 OK 绝大多数发生在会话**空闲**期 —— 那一刻所有实例的 `/sessions/live` 和 `/status.activeSessionId` 都可能为空，于是路由必然落空，报 `Conv not in live window`。
+
+现在的做法（`gw_discover.deliver_candidates`，5 条互相独立的键，按可信度排序）：
+
+| 优先级 | 判定键 | 说明 |
+|---|---|---|
+| 0 | 心跳文件 endpoint **且** owner 一致 | 心跳里写死了 `sessionId → endpoint`，最硬 |
+| 1 | `/info.cwd` == 会话 cwd **且** owner 一致 | 两个独立来源同时确认 |
+| 2 | `/info.cwd` == 会话 cwd | **与忙闲无关**，真正解决问题的一条 |
+| 3 | `/status.activeSessionId` == sid | 运行时归属 |
+| 4 | `/sessions/live.sessionId` == sid | writer 附着时才非空 |
+| 5/6 | 会话列表里含 sid / 其余实例 | 兜底，靠 409 过滤 |
+
+其中「`/info.cwd` ↔ 会话 cwd」是关键：`/api/v1/info` 返回该实例的工作目录，会话心跳文件里写着同一个 cwd，两边一对就把"会话"钉在了"实例"上 —— 跟会话忙不忙、writer 在不在毫无关系。
+
+投递流程（`wb_bridge.deliver_text`）：**等空闲 → 锁实例投递 → 回读验真 → 没落库就重来**，最长等 `_BUSY_WAIT_MAX`（240s）。投递在独立线程里跑（`_deliver_async`），不会卡住 BLE 事件线程。
+
+排障三件套：
+
+```bash
+curl "http://127.0.0.1:8765/route?sid=<会话id>"     # 这个会话会被投到哪个实例、凭什么
+curl "http://127.0.0.1:8765/send?text=hi&conv=<id>" # 走完整投递链路（跳过 ASR）
+python session_tail.py <会话id> 20                   # 回读会话记录，看消息到底落库没有
+python live_map.py <会话id前缀>                      # 现场全景：心跳/实例/归属
+```
+
 
 ---
 

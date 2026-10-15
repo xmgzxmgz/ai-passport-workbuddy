@@ -604,6 +604,203 @@ def discover_gateway(verbose=False, prefer_sid=None):
             "pid": best["pid"], "host": best["host"], "cached": False}
 
 
+# ===========================================================================
+# 投递候选：会话 -> 应该把 reply 发到哪个网关实例（2026-10-15 18:20 定稿）
+# ===========================================================================
+#
+# 为什么需要这一层
+# ----------------
+# 逆向网关（app.asar 内嵌 OpenAPI + sessions 控制器源码）拿到权威语义：
+#
+#   async replySession(id, body) {
+#     const cur = this.sessionManager.sessionSubject.value;   // 本实例装载的会话
+#     if (!canDeliverFollowReply(cur?.id, id) || !cur)        // cur.id === id
+#       409 SESSION_FOLLOW_NOT_LIVE;
+#     await this.agentService.runDefault(buildFollowReplyItems(text, cur.id),
+#                                        { context: cur, inputOrigin: "human" });
+#   }
+#
+# 即：**只有把 reply 发到"恰好装载着目标会话"的那一个网关实例才会成功，
+# 发到别的实例一律 409**（好在 409 是干净的 —— 不会污染别的对话）。
+# 所以问题彻底归结为「sessionId -> 实例」的映射准不准。
+#
+# 单靠 live / owner 两条键不够：两者都来自网关的**运行时状态**，会话空闲
+# 时都可能缺席或指向别处（工牌按 OK 绝大多数发生在空闲期，于是十投九败，
+# 报 "Conv not in live window"）。
+#
+# 现在改用 5 条互相独立的键，键与键之间取"最先命中"，全部失败还有兜底：
+#
+#   0  heartbeat endpoint 且 owner==sid     心跳写死了 endpoint，最硬
+#   1  /info.cwd == 会话 cwd 且 owner==sid  两个独立来源同时确认
+#   2  /info.cwd == 会话 cwd                工作目录唯一，**与忙闲无关**
+#   3  /status.activeSessionId == sid       运行时归属
+#   4  /sessions/live.sessionId == sid      writer 附着时才有
+#   5  /sessions 列表里含 sid               该实例至少认识这个会话
+#   9  其余实例                             最后手段，靠 409 过滤 + 落库验真
+#
+# 其中 2 是这次新增、也是真正解决问题的一条：/api/v1/info 返回该实例的
+# `cwd`（工作目录），而会话心跳文件里本来就写着同一个 cwd。两边都对得上，
+# 就把"会话"钉在了"实例"上，跟会话忙不忙、writer 在不在都没关系。
+
+def _api(port, password, path, timeout=1.5):
+    """带认证 GET 一个网关端点，返回解析后的 JSON（dict）或 None。"""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v1/{path}",
+        headers={"Authorization": f"Bearer {password}",
+                 "X-CodeBuddy-Request": "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def _data_of(obj):
+    d = (obj or {}).get("data")
+    return d if isinstance(d, dict) else {}
+
+
+def session_cwd(sid):
+    """会话的工作目录（cwd）—— 用于把会话钉到实例上。
+
+    两个独立来源，优先心跳（快、且带 kind 可以排掉 CLI host）：
+      1. ~/.workbuddy/sessions/*.json 里 sessionId 匹配项的 cwd
+      2. 会话 jsonl 第一行的 cwd 字段
+    找不到返回 None。
+    """
+    if not sid:
+        return None
+    best = None
+    root = Path("~/.workbuddy/sessions").expanduser()
+    try:
+        files = list(root.glob("*.json"))
+    except OSError:
+        files = []
+    for path in files:
+        try:
+            d = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:                              # noqa: BLE001
+            continue
+        if d.get("sessionId") != sid:
+            continue
+        cwd = str(d.get("cwd") or "")
+        if not cwd:
+            continue
+        # CLI host 子进程会为同一个 sid 写另一份心跳，cwd 在临时目录里
+        is_cli_host = ("workbuddy-host-cli" in cwd
+                       or cwd.startswith("/private/var/folders"))
+        if is_cli_host:
+            if best is None:
+                best = cwd                            # 只有 CLI 的也先记着
+            continue
+        return cwd
+    if best:
+        return best
+    # 心跳没写 cwd（或文件已清）时退回 jsonl 首行
+    try:
+        hits = list(Path("~/.workbuddy/projects").expanduser()
+                    .glob(f"*/{sid}.jsonl"))
+    except OSError:
+        hits = []
+    for p in hits:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+            d = json.loads(first)
+            cwd = d.get("cwd") or (d.get("meta") or {}).get("cwd")
+            if cwd:
+                return str(cwd)
+        except Exception:                              # noqa: BLE001
+            continue
+    return None
+
+
+def gateway_cwd(port, password, timeout=1.5):
+    """该实例的工作目录（/api/v1/info 的 data.cwd）。实例强标识。"""
+    return str(_data_of(_api(port, password, "info", timeout)).get("cwd") or "")
+
+
+def gateway_status_of(port, password, timeout=1.5):
+    """该实例 /status 的 data（含 activeSessionId / busy / runStatus）。"""
+    return _data_of(_api(port, password, "status", timeout))
+
+
+_CAND = {"sid": None, "at": 0.0, "rows": []}
+_CAND_TTL = 4.0                 # 候选缓存：太短会打爆探测，太长会错过重绑定
+
+
+def deliver_candidates(sid, force=False, verbose=False):
+    """返回把 reply 投给 sid 的候选实例列表（已按可信度升序排序）。
+
+    每项 {"base","password","why","score","owner","live","cwd"}。
+    空列表 = 连一个网关都找不到。
+    """
+    now = time.monotonic()
+    if (not force) and _CAND["sid"] == sid and now - _CAND["at"] < _CAND_TTL:
+        return _CAND["rows"]
+    rows = _candidates_impl(sid, verbose=verbose)
+    _CAND.update(sid=sid, at=now, rows=rows)
+    return rows
+
+
+def _candidates_impl(sid, verbose=False):
+    cred = find_gateway(skip_self=False) or find_gateway(skip_self=True)
+    if not cred:
+        if verbose:
+            print("[gw] 无凭据，候选为空")
+        return []
+    pw = cred["password"]
+    ports = find_gateway_ports(password=pw)
+    if not ports:
+        return []
+    hb_cwd = session_cwd(sid)
+    hb_ep = (endpoint_for_session(sid) or "").rstrip("/")
+    rows = []
+    for p in ports:
+        base = f"http://127.0.0.1:{p}"
+        cwd = gateway_cwd(p, pw)
+        st = gateway_status_of(p, pw)
+        owner = st.get("activeSessionId") or None
+        live = _live_session_on(p, pw)
+        score, why = 9, ["fallback"]
+        if owner == sid:
+            score, why = 3, ["owner"]
+        if cwd and hb_cwd and cwd == hb_cwd:
+            if owner == sid:
+                score, why = 1, ["cwd+owner"]
+            elif score > 2:
+                score, why = 2, ["cwd"]
+            else:
+                why = why + ["cwd"]
+        if live == sid and score > 4:
+            score, why = 4, ["live"]
+        if hb_ep and base == hb_ep:
+            if not owner or owner == sid:
+                score, why = 0, ["hb-endpoint"]
+            else:
+                score, why = 5, ["hb-endpoint(owner 不符)"]
+        if score == 9:
+            # 兜底键：该实例的会话列表里有这个会话（说明它至少认识）
+            try:
+                rowsj = _data_of(_api(p, pw, "sessions")).get("sessions") or []
+                if any(str(r.get("id")) == sid for r in rowsj):
+                    score, why = 6, ["listed"]
+            except Exception:                          # noqa: BLE001
+                pass
+        is_cli_host = "workbuddy-host-cli" in cwd
+        rows.append({"base": base, "password": pw, "score": score,
+                     "why": "+".join(why), "owner": owner, "live": live,
+                     "cwd": cwd, "port": p, "cli_host": is_cli_host})
+    # CLI host 实例永远排在最后（它的会话属于 CLI，不是屏幕上的窗口）
+    rows.sort(key=lambda r: (r["score"] + (5 if r["cli_host"] else 0), r["port"]))
+    if verbose:
+        print(f"[gw] 会话 {str(sid)[:8]} cwd={hb_cwd}")
+        for r in rows:
+            print(f"[gw]   {r['base']} score={r['score']} [{r['why']}] "
+                  f"owner={str(r['owner'])[:8]} live={str(r['live'])[:8]}")
+    return rows
+
+
 
 if __name__ == "__main__":
     found = discover_gateway(verbose=True)
