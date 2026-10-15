@@ -85,6 +85,12 @@ MSG_BODY_MAX  = 120       # WB_TEXT_LEN
 ASR_BODY_MAX  = 170       # 转写回显 ≤ WB_ASR_LEN(200)，留帧头 + UTF-8 余量
 VOICE_MAX_SEC = 60        # 语音上限，防呆（固件侧同样有独立上限）
 
+# 最短音频下限（毫秒）。默认 0 = 不设限，交给 Whisper 自己判断。
+# 早前硬编码 1600 字节（0.1s），真机上把大量「音频根本没传上来」（0 包
+# 0 字节）伪装成 "Audio too short"，用户只能一遍遍重录、误以为是自己
+# 说得太短。想恢复旧行为：export WB_MIN_AUDIO_MS=100
+MIN_AUDIO_MS = int(os.environ.get("WB_MIN_AUDIO_MS", "0") or 0)
+
 # 语音 WAV 保留策略：每次录音落一个文件，不清理会一直堆
 VOICE_KEEP_MAX = 200      # 最多保留多少个
 VOICE_KEEP_DAYS = 30      # 或者最多保留多少天
@@ -1565,8 +1571,19 @@ def _dispatch(ble: BleCenter, cmd: int, pl: bytes):
     elif cmd == U_VOICE_END:
         with ble._vbuf_lock:
             n = len(ble.voice_buf)
+        # tail = chunks16 + samples32（固件 voice_task 的收尾包）。这条信息
+        # 是排查音频丢失的关键：packets=0 而 samples 很大，说明麦克风采到了
+        # 数据但**一个包都没推上来**（BLE 推流失败）；samples=0 则说明麦克风
+        # 压根没出数据（codec 唤醒/I2S 问题）。bridge 早前只打字节数，
+        # 把这两种完全不同的故障显示成同一句话（2026-10-15 加）。
+        dev = ""
+        if len(pl) >= 6:
+            pkts = pl[0] | (pl[1] << 8)
+            smp = (pl[2] | (pl[3] << 8) | (pl[4] << 16) | (pl[5] << 24))
+            dur = smp / ble.voice_rate if ble.voice_rate else 0.0
+            dev = f", dev_pkts={pkts}, dev_samples={smp} ({dur:.2f}s)"
         tag = " (TRUNCATED@%ds)" % VOICE_MAX_SEC if ble.voice_truncated else ""
-        print(f"[RX] voice end, {n} bytes, seq_lost={ble.voice_lost}{tag}",
+        print(f"[RX] voice end, {n} bytes, seq_lost={ble.voice_lost}{dev}{tag}",
               flush=True)
 
     elif cmd == U_VOICE_ABORT:
@@ -1835,9 +1852,22 @@ def handle_voice_send(ble: BleCenter, idx: int, mode: int = SEND_AUTO):
         pcm = bytes(ble.voice_buf)
         ble.voice_buf = bytearray()
 
-    if len(pcm) < 1600:            # 少于 0.1 秒
-        ble.send(asr_frame(False, "Audio too short"))
-        ble.send(sent_frame(False, "Audio too short"))
+    # 最短音频下限：默认 0（不设限）。早前硬编码 1600 字节（0.1s），而真机
+    # 日志里绝大多数录音是 **0 字节**（设备一个音频包都没推上来）—— 限制把
+    # "音频没传上来" 伪装成了 "Audio too short"，用户只会反复重录。现在一律
+    # 交给 ASR 判断；真要设下限就用 WB_MIN_AUDIO_MS。
+    min_bytes = int(ble.voice_rate * 2 * MIN_AUDIO_MS / 1000)
+    if min_bytes and len(pcm) < min_bytes:
+        print(f"[VOICE] too short: {len(pcm)}B < {MIN_AUDIO_MS}ms "
+              f"({min_bytes}B)", flush=True)
+        ble.send(asr_frame(False, f"Audio {len(pcm)}B too short"))
+        ble.send(sent_frame(False, f"Audio {len(pcm)}B too short"))
+        return
+    if not pcm:
+        # 一包都没收到：是链路问题，不是"你说得太短"。如实报，别甩锅给用户。
+        print("[VOICE] empty capture (0 bytes) -> 音频未上传", flush=True)
+        ble.send(asr_frame(False, "No audio received"))
+        ble.send(sent_frame(False, "No audio received"))
         return
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")

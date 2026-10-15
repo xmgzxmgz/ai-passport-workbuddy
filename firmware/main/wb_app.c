@@ -724,10 +724,15 @@ static void record_finish(void)
     uint32_t ms = wb_voice_ms();
     wb_voice_stop();
 
-    if (ms < 300) {
+    // 只在"一个样本都没采到"时拦（= 纯误触，或麦克风/编解码器没出数据）。
+    // 早前是 <300ms 直接拒绝上传，实机上短句和连点经常撞上，屏幕停在
+    // TOO SHORT 只能重录；而 codec 唤醒 + I2S 建链本身要吃掉开头一两百
+    // 毫秒，越短的句子越容易被判"太短"。现在只要有音频就照常上传，交给
+    // PC 侧 ASR 判断（真没人声会回 "No speech detected"）。
+    if (ms == 0) {
         s_rec_state = REC_IDLE;
-        lv_label_set_text(s_r_title, "TOO SHORT");
-        lv_label_set_text(s_r_sub, "Hold on, try again");
+        lv_label_set_text(s_r_title, "NO AUDIO");
+        lv_label_set_text(s_r_sub, "Mic gave nothing - try again");
         lv_obj_set_style_bg_color(s_r_dot, lv_color_hex(C_WARN), 0);
         return;
     }
