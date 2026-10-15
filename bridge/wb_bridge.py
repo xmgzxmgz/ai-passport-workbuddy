@@ -836,12 +836,13 @@ _GW_ACTIVE_TTL = 10.0          # 网关活跃会话的短缓存（秒）
 
 
 def gateway_active_session():
-    """当前 GUI 活跃会话 id（带 10s TTL 缓存）。
+    """当前 GUI 活会话 id（带 10s TTL 缓存）。
 
-    该端点要消耗网关配额。一次发送本来只调一次不算热路径，但历史上
-    `_pick_target_session` 的多条路径会重复调它，加上缓存兜底防抖。
-    本机实测较新网关的 /status 不返回 activeSessionId（只有
-    status/busy/lastCompletedAt），所以 None 是常态，不是故障。
+    权威来源是网关的 GET /api/v1/sessions/live（返回 {sessionId,
+    writerOccupied}）——逆向自 WorkBuddy 网关内嵌 OpenAPI。
+    历史教训：/status 的 activeSessionId 语义是"最近有 run 的会话"
+    而非屏幕上开着的；本地心跳则会被 CLI host 子进程污染。live 端点
+    三者皆无，实测返回的就是眼前窗口的会话。
     """
     now = time.monotonic()
     if now - _GW_ACTIVE["at"] < _GW_ACTIVE_TTL:
@@ -849,10 +850,14 @@ def gateway_active_session():
     sid = None
     base, pw = _discover()
     if base:
+        req = urllib.request.Request(
+            f"{base}/api/v1/sessions/live",
+            headers={"Authorization": f"Bearer {pw}",
+                     "X-CodeBuddy-Request": "1"})
         try:
-            import gw_discover
-            st = gw_discover.probe_gateway(base, pw) or {}
-            sid = st.get("activeSessionId")
+            with urllib.request.urlopen(req, timeout=6) as r:
+                body = json.loads(r.read().decode("utf-8", "replace"))
+            sid = ((body or {}).get("data") or {}).get("sessionId") or None
         except Exception:                             # noqa: BLE001
             sid = None
     _GW_ACTIVE.update(sid=sid, at=now)
@@ -886,23 +891,6 @@ def gateway_sessions(limit=10):
     return rows[:limit]
 
 
-def gateway_sessions(limit=10):
-    """从网关读会话列表（比翻 sqlite 更准，含 GUI 刚建的会话）。"""
-    base, pw = _discover()
-    if not base:
-        return []
-    req = urllib.request.Request(
-        f"{base}/api/v1/sessions",
-        headers={"Authorization": f"Bearer {pw}", "X-CodeBuddy-Request": "1"})
-    try:
-        with urllib.request.urlopen(req, timeout=6) as r:
-            body = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:                                 # noqa: BLE001
-        return []
-    rows = ((body or {}).get("data") or {}).get("sessions") or []
-    return rows[:limit]
-
-
 def _post_run(base, pw, body, timeout=25):
     req = urllib.request.Request(
         f"{base}/api/v1/runs",
@@ -915,26 +903,42 @@ def _post_run(base, pw, body, timeout=25):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+class _NotLive(Exception):
+    """目标会话不是当前活会话（reply 端点 409）。"""
+
+
 def _send_via_gateway(base, pw, session_id, text, sender_id, timeout=25):
-    run_id = uuid.uuid4().hex
-    conv = session_id or run_id
-    body = {
-        "id": run_id,
-        "type": "message",
-        "text": text,
-        "source": {
-            "platform": "generic",
-            "sender": {"id": sender_id, "name": "AI Passport"},
-            "conversation": {"id": conv, "type": "direct"},
-        },
-    }
-    payload = _post_run(base, pw, body, timeout=timeout)
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict) or not data.get("runId"):
-        raise RuntimeError(f"bad response: {str(payload)[:60]}")
-    print(f"[GW] run {str(data['runId'])[:8]} -> conv={str(conv)[:8]} "
+    """把文本投进指定会话。走 POST /api/v1/sessions/{id}/reply。
+
+    逆向结论（app.asar 内嵌 OpenAPI）：
+      * POST /api/v1/runs = "发起 Agent 执行" —— 每次创建一个新后台任务，
+        语音文本全变成任务名，消息永远不进对话（实机踩坑两轮）；
+      * POST /api/v1/sessions/{id}/reply = "向当前活会话投递回复"，
+        body {"text": ...}，返回 {"delivered": bool}，GUI 实时渲染。
+    只接受"当前活会话"，投给别的会话返回 409 —— 抛 _NotLive 让上层
+    重新解析目标。忙碌会话不受影响（writerOccupied=true 实测照常投递）。
+    """
+    body = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/api/v1/sessions/{session_id}/reply",
+        data=body,
+        headers={"Authorization": f"Bearer {pw}",
+                 "X-CodeBuddy-Request": "1",
+                 "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as he:
+        if he.code == 409:
+            raise _NotLive(session_id) from None
+        raise
+    delivered = ((payload or {}).get("data") or {}).get("delivered")
+    if not delivered:
+        raise RuntimeError(f"not delivered: {str(payload)[:60]}")
+    print(f"[GW] reply -> conv={str(session_id)[:8]} "
           f"sender={sender_id}", flush=True)
-    return data["runId"]
+    return True
 
 
 def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
@@ -954,10 +958,25 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
     if not base:
         return False, "Gateway offline"
 
-    def attempt(b, p):
+    def attempt(b, p, target):
         try:
-            _send_via_gateway(b, p, session_id, text, sender, timeout=timeout)
+            _send_via_gateway(b, p, target, text, sender, timeout=timeout)
             return True, "Sent"
+        except _NotLive:
+            # 目标不是当前活会话 -> 用 live 端点重定目标（缓存立即失效）
+            _GW_ACTIVE.update(sid=None, at=0.0)
+            live = gateway_active_session()
+            if not live:
+                return False, "No active session"
+            if live == target:
+                return False, "Not live (live==target)"
+            print(f"[GW] 409, retarget {str(target)[:8]} -> {str(live)[:8]}",
+                  flush=True)
+            try:
+                _send_via_gateway(b, p, live, text, sender, timeout=timeout)
+                return True, "Sent"
+            except _NotLive:
+                return False, "Retarget still 409"
         except urllib.error.HTTPError as he:
             if he.code == 429:
                 return False, "busy"
@@ -976,12 +995,12 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
     for i, wait in enumerate((0.0, 2.5, 5.0)):    # 退避：立刻 -> 2.5s -> 5s
         if wait:
             time.sleep(wait)
-        ok, msg = attempt(base, pw)
+        ok, msg = attempt(base, pw, session_id)
         if ok is None:                            # 401/URLError：GUI 重启过，重新发现
             base, pw = _discover(force=True)
             if not base:
                 return False, "Gateway offline"
-            ok, msg = attempt(base, pw)
+            ok, msg = attempt(base, pw, session_id)
         if ok:
             return True, "Sent"
         last = (ok, msg)
@@ -1440,29 +1459,21 @@ def _dispatch(ble: BleCenter, cmd: int, pl: bytes):
 def _pick_target_session(ble: BleCenter, idx: int):
     """决定这句话投到哪个对话，返回 (session_id, 来源标签)。
 
-    投给"WorkBuddy 窗口里此刻开着的那一个"，GUI 才会有反应。
+    投递走 reply 端点，它只接受"当前活会话"，所以目标必须以网关的
+    GET /api/v1/sessions/live 为准（逆向自 app.asar 内嵌 OpenAPI，
+    返回 {sessionId, writerOccupied}，就是屏幕上开着的那个）。
 
-    实机验证后的优先级（和直觉相反，本地心跳最准）：
-      1. 本地心跳 ~/.workbuddy/sessions/*.json 里最新的 GUI 会话
-         —— 零网络请求、零配额。空闲时心跳约 2 分钟一跳，容忍 180s。
-      2. 网关 /api/v1/sessions 里 isCurrent==true（本机实测列表里根本
-         不含 GUI 正开的会话，isCurrent 恒 False —— 仅作兜底）
-      3. 网关 /status 的 activeSessionId —— 实测语义是"最近有 run 的
-         会话"而不是"屏幕上开着的"，投进去 GUI 不切过去，用户毫无
-         感知（表现为 SENT 但窗口没反应）。只作最后兜底。
-      4. 设备选中的 conv id
+    优先级：
+      1. 网关 /api/v1/sessions/live —— 权威、免费、无歧义（10s 缓存）
+      2. 本地心跳 —— live 不可用时的兜底（latest_heartbeat 已过滤 CLI host）
+      3. 设备选中的 conv id
     """
+    active = gateway_active_session()
+    if active:
+        return str(active), "live"
     hb_at, _cwd, hb_sid = latest_heartbeat()
     if hb_sid and hb_at and (time.time() * 1000 - hb_at) < 180_000:
         return str(hb_sid), "heartbeat"
-    for s in gateway_sessions(5):
-        if s.get("isCurrent"):
-            sid = s.get("id") or s.get("sessionId")
-            if sid:
-                return str(sid), "current"
-    active = gateway_active_session()
-    if active:
-        return str(active), "active"
     if 0 <= idx < len(ble.convs):
         return ble.convs[idx]["id"], "device"
     if ble.convs:
@@ -1470,53 +1481,18 @@ def _pick_target_session(ble: BleCenter, idx: int):
     return None, "none"
 
 
-def _is_session_busy(sid):
-    """会话是否正忙（agent 在跑）。查本地 DB，只读。"""
-    if not sid:
-        return False
-    con = _read_db()
-    if con is None:
-        return False
-    try:
-        row = con.execute("SELECT status FROM sessions WHERE id = ?",
-                          (sid,)).fetchone()
-    except sqlite3.Error:
-        return False
-    finally:
-        con.close()
-    return bool(row) and row[0] == "working"
-
-
-_BUSY_WAIT_MAX = 90          # 最长等目标会话空闲的时间（秒）
-_BUSY_POLL = 3.0
-
-
 def _deliver(ble: BleCenter, idx: int, text: str):
-    """真正投递一句话，并把回执推给工牌。"""
+    """真正投递一句话，并把回执推给工牌。
+
+    reply 端点不挑忙碌状态（writerOccupied=true 实测照常投递），
+    之前"等空闲 90s"的等待逻辑基于 runs 端点的错误认知，已删除。
+    """
     sid, how = _pick_target_session(ble, idx)
-
-    # 实测大坑：向 status=working 的会话投递，网关返回 ok 但消息被静默
-    # 丢弃（run active:false，消息库里也没有）。空闲会话则正常显示并
-    # 触发回复。而用户的使用场景恰恰是对着正在干活的对话说话 —— 所以
-    # 这里等它空闲再投，设备屏幕停留 SENDING。
-    waited = 0.0
-    while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
-        if waited == 0.0:
-            print(f"[SEND] target busy, waiting idle: {str(sid)[:8]}",
-                  flush=True)
-        time.sleep(_BUSY_POLL)
-        waited += _BUSY_POLL
-
     ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble))
     if ok:
         ble.send(sent_frame(True, reply or "Sent"))
         ble.selected = idx
-        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how} "
-              f"(waited {waited:.0f}s)", flush=True)
-    elif _is_session_busy(sid):
-        print(f"[SEND] aborted, target still busy: {str(sid)[:8]}",
-              flush=True)
-        ble.send(sent_frame(False, "Session busy"))
+        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how}", flush=True)
     else:
         print(f"[SEND] failed ({how}): {reply}", flush=True)
         ble.send(sent_frame(False, reply))
