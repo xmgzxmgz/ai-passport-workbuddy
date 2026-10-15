@@ -438,6 +438,60 @@ def _save_cached_port(port):
 # 对外主入口
 # ===========================================================================
 
+def endpoint_for_session(sid, max_age=900.0):
+    """会话 -> 网关地址：直接读会话心跳文件里写着的 endpoint。
+
+    2026-10-15 17:40 决定性发现（"Conv not in live window" 的真根因）：
+    空闲期**所有**网关实例对 /status 匿名（activeSessionId 不返回），
+    /sessions/live 也是 null —— 于是 live/owner 两条路由键同时失效。
+    而工牌按 OK 恰恰都发生在会话空闲期，所以路由十次九败。
+
+    而 `~/.workbuddy/sessions/<pid>.json` 里本来就写着：
+
+        {"sessionId": "fb0f0677-...", "url": "http://127.0.0.1:53403",
+         "endpoint": "http://127.0.0.1:53403", "updatedAt": 1792056992339}
+
+    这就是 sessionId -> 网关 的**权威映射，与忙闲无关**。实测
+    fb0f0677 -> 53403，与 /status 忙时报告的实例完全一致。
+
+    max_age：心跳新鲜度上限（秒），避免拿到早已退出会话的陈旧端口。
+    """
+    if not sid:
+        return None
+    now_ms = time.time() * 1000
+    cands = []
+    root = Path("~/.workbuddy/sessions").expanduser()
+    try:
+        files = list(root.glob("*.json"))
+    except OSError:
+        return None
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:                             # noqa: BLE001
+            continue
+        if d.get("sessionId") != sid:
+            continue
+        base = d.get("endpoint") or d.get("url")
+        if not base:
+            continue
+        hb = d.get("lastHeartbeat") or d.get("updatedAt") or 0
+        if hb and max_age and (now_ms - hb) > max_age * 1000:
+            continue                                  # 陈旧心跳，别用
+        # 同一个 sessionId 可能有多个心跳文件：GUI 窗口的（cwd 是项目目录）
+        # 和 CLI host 子进程的（cwd 在 /private/var/.../workbuddy-host-cli/
+        # 临时目录）。投递要走 GUI 那个，否则消息进了 CLI 自己的会话，
+        # 屏幕上什么都不会出现。
+        cwd = str(d.get("cwd") or "")
+        is_cli_host = "workbuddy-host-cli" in cwd or cwd.startswith("/private/var/folders")
+        cands.append((1 if is_cli_host else 0, -float(hb or 0), str(base).rstrip("/")))
+    if not cands:
+        return None
+    cands.sort()                                      # 非 CLI host 优先，再取最新
+    return cands[0][2]
+
+
 def _live_session_on(port: int, password: str, timeout=1.5):
     """该端口网关的 /api/v1/sessions/live sessionId。
 

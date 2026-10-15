@@ -897,14 +897,21 @@ _ROUTE_MISS_TTL = 2.0     # 失败只缓存 2s：网关重绑定窗口内要能�
 
 
 def _route_to_instance(sid, force=False):
-    """找到 live 恰好等于 sid 的网关实例，返回 (base, pw) 或 (None, None)。
+    """找到 sid 所属的网关实例，返回 (base, pw) 或 (None, None)。
 
-    2026-10-15 实机踩坑（两个）：
+    三级匹配（依次尝试）：
+      0. 心跳文件 endpoint（sessionId 写死在 ~/.workbuddy/sessions/*.json）——
+         **唯一与忙闲无关的键**，空闲期也能命中（2026-10-15 17:40 找到）
+      1. /sessions/live == sid（writer 附着中，权威）
+      2. /status.activeSessionId == sid（有归属字段时兜底）
+
+    2026-10-15 实机踩坑：
       * 两个 WorkBuddy 窗口 = 两个网关实例，默认发现会抓错实例 ——
-        用户选了 A 对话，消息却投进 B 窗口的会话。多实例下必须按
-        「对话 -> live 匹配的实例」路由；
-      * WorkBuddy 每轮运行都会重启会话网关（端口一天四变），发送
-        瞬间撞上重绑定窗口会找不到匹配实例 —— 调用方需带重试。
+        用户选了 A 对话，消息却投进 B 窗口的会话；
+      * WorkBuddy 每轮运行都会重启会话网关（端口一天多变），发送
+        瞬间撞上重绑定窗口会找不到匹配实例 —— 调用方需带重试；
+      * **会话空闲时实例对 /status 匿名 + live 全 null**，1/2 两级同时
+        失效，这才是 "Conv not in live window" 反复出现的真根因。
     """
     now = time.monotonic()
     if (not force) and _ROUTE["sid"] == sid:
@@ -916,13 +923,31 @@ def _route_to_instance(sid, force=False):
     try:
         import gw_discover
         insts = gw_discover.discover_instances(prefer_sid=sid)
-        # 两级匹配：live（权威，writer 附着中）> owner（/status 归属，
-        # 空闲期唯一可用 —— 2026-10-15 实测空闲时全实例 live=None）
-        for inst in insts:
-            if inst["live_sid"] == sid:
-                route = (inst["base"], inst["password"])
-                how_matched = "live"
-                break
+        pw_any = insts[0]["password"] if insts else None
+        # ---- 0 级（最强）：心跳文件里的 sessionId -> endpoint 映射 ----
+        # 2026-10-15 17:40 真根因：会话空闲时**所有**实例对 /status 匿名
+        # （activeSessionId 不返回）、/sessions/live 全为 null，live 与
+        # owner 两条键同时失效 —— 而工牌按 OK 恰恰都在空闲期，所以路由
+        # 十次九败，报 "Conv not in live window"。而心跳文件里写死的
+        # {"sessionId":..., "endpoint":"http://127.0.0.1:53403"} 是唯一
+        # 与忙闲无关的权威映射（实测 fb0f0677 -> 53403 与忙时 /status 一致）。
+        ep = gw_discover.endpoint_for_session(sid)
+        if ep and pw_any:
+            st = gw_discover.probe_gateway(ep, pw_any)
+            own = (st or {}).get("activeSessionId")
+            # 可用条件：能认证通；且若它自报归属会话则必须就是目标。
+            # 空闲期不报归属是正常的 —— 那正是要用这条映射的原因。
+            if st and (not own or own == sid):
+                route = (ep, pw_any)
+                how_matched = "heartbeat"
+        # ---- 1 级：live（writer 附着中，权威）----
+        if not route[0]:
+            for inst in insts:
+                if inst["live_sid"] == sid:
+                    route = (inst["base"], inst["password"])
+                    how_matched = "live"
+                    break
+        # ---- 2 级：owner（/status 归属，兜底）----
         if not route[0]:
             for inst in insts:
                 if inst["owner_sid"] == sid:
@@ -931,6 +956,7 @@ def _route_to_instance(sid, force=False):
                     break
         if not route[0]:
             # 失败时把看到的实例都打出来，方便事后诊断
+            print(f"[GW]   hb_endpoint={ep or '(none)'}", flush=True)
             for inst in insts:
                 print(f"[GW]   cand {inst['base']} live="
                       f"{str(inst['live_sid'])[:8]} "
@@ -942,7 +968,8 @@ def _route_to_instance(sid, force=False):
         print(f"[GW] routed {str(sid)[:8]} -> {route[0]} ({how_matched})",
               flush=True)
     else:
-        print(f"[GW] no instance live/owner=={str(sid)[:8]}", flush=True)
+        print(f"[GW] route miss: 心跳 endpoint / live / owner 都没命中 "
+              f"{str(sid)[:8]}", flush=True)
     return route
 
 
