@@ -881,6 +881,37 @@ _GW_SESS_CACHE = {"rows": None, "at": 0.0}
 _GW_SESS_TTL = 5.0
 
 
+_ROUTE = {"sid": None, "at": 0.0, "route": None}
+_ROUTE_TTL = 15.0
+
+
+def _route_to_instance(sid, force=False):
+    """找到 live 恰好等于 sid 的网关实例，返回 (base, pw) 或 (None, None)。
+
+    2026-10-15 实机踩坑：两个 WorkBuddy 窗口 = 两个网关实例，默认发现
+    会抓错实例 —— 用户选了 A 对话，消息却投进 B 窗口的会话。多实例下
+    必须按「对话 -> live 匹配的实例」路由，而不是随便挑一个网关。
+    """
+    now = time.monotonic()
+    if (not force) and _ROUTE["sid"] == sid and now - _ROUTE["at"] < _ROUTE_TTL:
+        return _ROUTE["route"]
+    route = (None, None)
+    try:
+        import gw_discover
+        for inst in gw_discover.discover_instances(prefer_sid=sid):
+            if inst["live_sid"] == sid:
+                route = (inst["base"], inst["password"])
+                break
+    except Exception as e:                        # noqa: BLE001
+        print(f"[GW] route failed: {type(e).__name__}: {e}", flush=True)
+    _ROUTE.update(sid=sid, at=now, route=route)
+    if route[0]:
+        print(f"[GW] routed {str(sid)[:8]} -> {route[0]}", flush=True)
+    else:
+        print(f"[GW] no instance live=={str(sid)[:8]}", flush=True)
+    return route
+
+
 def gateway_sessions(limit=10):
     """从网关读会话列表（比翻 sqlite 更准，含 GUI 刚建的会话）。带 5s 缓存。"""
     now = time.monotonic()
@@ -954,36 +985,42 @@ def _send_via_gateway(base, pw, session_id, text, sender_id, timeout=25):
     return True
 
 
-def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
+def send_to_workbuddy(session_id, text, timeout=25, sender_id=None,
+                      route=None, strict=False):
     """把文本发给指定对话。返回 (ok, 回执文本)。
 
-    网关限流是**按 sender.id 分桶**的令牌桶：
-        maxPerMinute = 60        （很宽松）
-        maxConcurrent = 3        （同时最多 3 个未完成的 run）
-    所以：
-      * sender.id 用**设备自己的标识**，别多台设备共用一个桶；
-      * 真人一次说一句不会撞并发上限，但连点可能有，故做退避重试。
+    route=(base,pw)：按对话路由到的网关实例（多窗口场景必须，
+    2026-10-15 踩坑）。strict=True：工牌明确选中的对话 —— 409 时
+    **不许**重定目标改投别的对话，如实报错。
     """
     if not text or not text.strip():
         return False, "empty text"
     sender = sender_id or _SENDER_ID
-    base, pw = _discover()
-    if not base:
-        # 撞上 GUI 重启窗口期（sidecar 未拉起）时短暂等待再试一次，
-        # 别把 "Gateway offline" 直接甩给用户（实测踩过）。
-        for _ in range(3):
-            time.sleep(3.0)
-            base, pw = _discover(force=True)
-            if base:
-                break
+    if route and route[0]:
+        base, pw = route
+    else:
+        base, pw = _discover()
         if not base:
-            return False, "Gateway offline"
+            # 撞上 GUI 重启窗口期（sidecar 未拉起）时短暂等待再试一次，
+            # 别把 "Gateway offline" 直接甩给用户（实测踩过）。
+            for _ in range(3):
+                time.sleep(3.0)
+                base, pw = _discover(force=True)
+                if base:
+                    break
+            if not base:
+                return False, "Gateway offline"
 
     def attempt(b, p, target):
         try:
             _send_via_gateway(b, p, target, text, sender, timeout=timeout)
             return True, "Sent"
         except _NotLive:
+            if strict:
+                # 用户明确选中的对话不是当前 live 窗口 —— 绝不改投
+                # 别的对话（2026-10-15：静默重定目标把消息投进了另
+                # 一个窗口的会话）。
+                return False, "Not live (picked conv)"
             # 目标不是当前活会话 -> 用 live 端点重定目标（缓存立即失效）
             _GW_ACTIVE.update(sid=None, at=0.0)
             live = gateway_active_session()
@@ -1027,8 +1064,14 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
         if wait:
             time.sleep(wait)
         ok, msg = attempt(base, pw, session_id)
-        if ok is None:                            # 401/URLError：GUI 重启过，重新发现
-            base, pw = _discover(force=True)
+        if ok is None:                            # 401/URLError：重新发现/重路由
+            if route and route[0]:
+                nb, npw = _route_to_instance(session_id, force=True)
+                if not nb:
+                    return False, "Gateway offline"
+                base, pw = nb, npw
+            else:
+                base, pw = _discover(force=True)
             if not base:
                 return False, "Gateway offline"
             ok, msg = attempt(base, pw, session_id)
@@ -1488,28 +1531,35 @@ def _dispatch(ble: BleCenter, cmd: int, pl: bytes):
 
 
 def _pick_target_session(ble: BleCenter, idx: int):
-    """决定这句话投到哪个对话，返回 (session_id, 来源标签)。
+    """决定这句话投到哪个对话、走哪个网关实例。
 
-    投递走 reply 端点，它只接受"当前活会话"，所以目标必须以网关的
-    GET /api/v1/sessions/live 为准（逆向自 app.asar 内嵌 OpenAPI，
-    返回 {sessionId, writerOccupied}，就是屏幕上开着的那个）。
+    返回 (session_id, 来源标签, route)；route=(base,pw) 为按对话路由到
+    的实例，(None,None) 表示用默认发现。
+
+    投递走 reply 端点，只接受该实例的"当前活会话"。多窗口下每个实例
+    各有自己的 live —— 所以用户在工牌上明确选中的对话是最高意图：
+    找 live 恰好等于它的实例路由过去；找不到就如实报错，**绝不偷偷
+    改投别的对话**（2026-10-15 踩坑：409 重定目标把消息投进了另一
+    个窗口的会话）。
 
     优先级：
-      1. 网关 /api/v1/sessions/live —— 权威、免费、无歧义（10s 缓存）
-      2. 本地心跳 —— live 不可用时的兜底（latest_heartbeat 已过滤 CLI host）
-      3. 设备选中的 conv id
+      1. 工牌选中的 conv —— 显式意图，strict
+      2. 本地心跳 —— 隐式跟随（latest_heartbeat 已过滤 CLI host）
+      3. 网关 live —— 无任何意图时跟随
     """
-    active = gateway_active_session()
-    if active:
-        return str(active), "live"
+    if 0 <= idx < len(ble.convs):
+        sid = str(ble.convs[idx]["id"])
+        return sid, "device", _route_to_instance(sid)
     hb_at, _cwd, hb_sid = latest_heartbeat()
     if hb_sid and hb_at and (time.time() * 1000 - hb_at) < 180_000:
-        return str(hb_sid), "heartbeat"
-    if 0 <= idx < len(ble.convs):
-        return ble.convs[idx]["id"], "device"
+        sid = str(hb_sid)
+        return sid, "heartbeat", _route_to_instance(sid)
+    active = gateway_active_session()
+    if active:
+        return str(active), "live", (None, None)
     if ble.convs:
-        return ble.convs[0]["id"], "fallback"
-    return None, "none"
+        return str(ble.convs[0]["id"]), "fallback", (None, None)
+    return None, "none", (None, None)
 
 
 def _is_session_busy(sid):
@@ -1542,7 +1592,20 @@ def _deliver(ble: BleCenter, idx: int, text: str):
     「测试语音输入。」在我处理中投递被丢）。GUI 自己的输入队列在
     内存里，外部够不着 —— 所以只能等空闲再投。
     """
-    sid, how = _pick_target_session(ble, idx)
+    sid, how, route = _pick_target_session(ble, idx)
+    if not sid:
+        ble.send(sent_frame(False, "No active session"))
+        print("[SEND] no target session", flush=True)
+        ble.push_all()
+        return
+    if how == "device" and not route[0]:
+        # 工牌明确选中的对话不是任何实例的 live（窗口没开着它）
+        # —— 如实报错。绝不改投别的对话（2026-10-15 踩坑）。
+        ble.send(sent_frame(False, "Conv not in live window"))
+        print(f"[SEND] device-picked conv {str(sid)[:8]} is not live "
+              f"on any instance", flush=True)
+        ble.push_all()
+        return
 
     waited = 0.0
     while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
@@ -1552,7 +1615,8 @@ def _deliver(ble: BleCenter, idx: int, text: str):
         time.sleep(_BUSY_POLL)
         waited += _BUSY_POLL
 
-    ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble))
+    ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble),
+                                  route=route, strict=(how == "device"))
     if ok:
         ble.send(sent_frame(True, reply or "Sent"))
         ble.selected = idx
