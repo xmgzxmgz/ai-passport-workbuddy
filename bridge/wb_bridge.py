@@ -822,7 +822,13 @@ def _discover(force=False):
             return _GW["base"], _GW["password"]
         try:
             import gw_discover
-            info = gw_discover.discover_gateway()
+            # 多窗口场景（2026-10-15 实机踩坑）：两个 WorkBuddy 窗口 = 两个
+            # GUI 网关实例，live 都非空，按端口序会抓到另一个窗口的网关。
+            # 把心跳侧最新会话 id 传过去，让发现逻辑优先选 live 匹配的实例。
+            hb_at, _cwd, hb_sid = latest_heartbeat()
+            prefer = (str(hb_sid) if hb_sid and hb_at
+                      and (time.time() * 1000 - hb_at) < 180_000 else None)
+            info = gw_discover.discover_gateway(prefer_sid=prefer)
         except Exception as e:                        # noqa: BLE001
             print(f"[GW] discover failed: {type(e).__name__}: {e}", flush=True)
             info = None
@@ -1006,7 +1012,7 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
             if he.code == 429:
                 return False, "busy"
             if he.code == 401:
-                return None                      # 密钥过期 -> 触发重发现
+                return None, "auth expired"      # 密钥过期 -> 触发重发现
             return False, f"HTTP {he.code}"
         except urllib.error.URLError:
             # 连接层失败（拒绝/超时）：WorkBuddy 重启后网关会换端口，

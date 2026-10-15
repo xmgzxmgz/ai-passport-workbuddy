@@ -249,14 +249,18 @@ def list_workbuddy_subprocesses() -> list[dict]:
     return rows
 
 
-def find_gateway():
-    """在所有 WorkBuddy 进程里找网关凭据。返回 dict 或 None。"""
-    # 快路径：本进程环境（被 WorkBuddy 拉起时直接命中，零成本）
-    env = env_from_self()
-    if env:
-        return {"pid": os.getpid(), "password": env[_GW_PASSWORD_KEY],
-                "base": "", "proxy": env.get("CODEBUDDY_SERVICE_PROXY_URL", ""),
-                "host": env.get("CODEBUDDY_HOST", "")}
+def find_gateway(skip_self=False):
+    """在所有 WorkBuddy 进程里找网关凭据。返回 dict 或 None。
+
+    skip_self=True 时跳过本进程环境（用于继承密钥过期后的重扫）。
+    """
+    if not skip_self:
+        # 快路径：本进程环境（被 WorkBuddy 拉起时直接命中，零成本）
+        env = env_from_self()
+        if env:
+            return {"pid": os.getpid(), "password": env[_GW_PASSWORD_KEY],
+                    "base": "", "proxy": env.get("CODEBUDDY_SERVICE_PROXY_URL", ""),
+                    "host": env.get("CODEBUDDY_HOST", "")}
 
     for proc in list_workbuddy_subprocesses():
         pid = proc.get("ProcessId")
@@ -453,17 +457,27 @@ def _live_session_on(port: int, password: str, timeout=1.5):
     return ((body or {}).get("data") or {}).get("sessionId") or None
 
 
-def discover_gateway(verbose=False):
+def discover_gateway(verbose=False, prefer_sid=None):
     """完整发现：读凭据 -> 定位端口 -> 组装 base。
 
     返回 {"base","password","pid","host"} 或 None。
-    端口每次 GUI 启动随机分配，但缓存后可直接命中，避免反复扫描。
 
-    实机踩坑：本机可能同时有多个网关实例（GUI + 各 CLI 会话），扫到的
-    第一个很可能是 CLI 的（live=null），投递给它一律 409/无效。所以
-    候选多于一个时，用 /sessions/live 非空来甄别 GUI 实例。
+    实机踩坑（2026-10-15，"No active session" 复发根因）：bridge 由
+    WorkBuddy 会话拉起时，环境里继承的 CODEBUDDY_GATEWAY_PASSWORD 是
+    **当时那个网关实例**的密钥。会话压缩/重启后网关换端口换密钥，旧密钥
+    对新网关一律 401 —— 快路径拿到的凭据必须经过验证，验证不过就放弃
+    继承环境、改扫活进程的密钥重试。
     """
-    cred = find_gateway()
+    info = _discover_impl(verbose, prefer_sid, skip_self=False)
+    if info is None or info.get("degraded"):
+        info2 = _discover_impl(verbose, prefer_sid, skip_self=True)
+        if info2:
+            return info2
+    return info
+
+
+def _discover_impl(verbose, prefer_sid, skip_self):
+    cred = find_gateway(skip_self=skip_self)
     if not cred:
         if verbose:
             print("[gw] 未能从任何 WorkBuddy 进程读到网关密钥")
@@ -474,29 +488,45 @@ def discover_gateway(verbose=False):
     pw = cred["password"]
 
     def pick(cands):
-        """从候选端口里挑 GUI 实例（live 非空）；全空则返回第一个。"""
+        """从候选端口里挑 GUI 实例，返回 (port, live_sid)。
+
+        实机踩坑（2026-10-15）：用户同时开着两个 WorkBuddy 窗口 =
+        两个 GUI 网关实例，live **都可能非空** —— 按端口序挑第一个会
+        抓到另一个窗口的网关，reply 一律 409 -> "No active session"。
+        调用方给出心跳侧最新会话 id（prefer_sid）时，优先选 live 恰好
+        等于它的实例 —— 心跳是「用户正在用的会话」，比端口序可靠得多。
+        """
+        if prefer_sid:
+            for p in cands:
+                sid = _live_session_on(p, pw)
+                if sid and sid == prefer_sid:
+                    if verbose:
+                        print(f"[gw] {p} live==heartbeat {str(sid)[:8]} <- 命中")
+                    return p, sid
         for p in cands:
             sid = _live_session_on(p, pw)
             if sid:
                 if verbose:
                     print(f"[gw] {p} live={str(sid)[:8]} <- GUI 网关")
-                return p
-        return cands[0] if cands else None
+                return p, sid
+        return (cands[0], None) if cands else (None, None)
 
     cached = _load_cached_port()
     if cached and _is_gateway_unauthed(cached):
-        port = pick([cached])
-        if port and _live_session_on(port, pw):
+        cached_live = _live_session_on(cached, pw)
+        # 缓存命中条件收紧：live 非空，且（无 prefer_sid 或恰好匹配）。
+        # 不匹配就当缓存失效，走全量扫描找正确实例。
+        if cached_live and (not prefer_sid or cached_live == prefer_sid):
             if verbose:
                 print(f"[gw] 端口缓存命中 {cached}")
-            return {"base": f"http://127.0.0.1:{port}", "password": pw,
+            return {"base": f"http://127.0.0.1:{cached}", "password": pw,
                     "pid": cred["pid"], "host": cred["host"], "cached": True}
-        # 缓存实例存在但 live 为空（可能是 CLI 网关）—— 继续扫描更好的
+        # 缓存实例 live 为空或不匹配目标会话 —— 全量扫描
 
     if verbose:
         print(f"[gw] 扫描 {len(listening_ports())} 个本地端口（无认证）…")
     ports = find_gateway_ports(password=pw)
-    port = pick(ports) if ports else None
+    port, live_sid = pick(ports) if ports else (None, None)
     if not port:
         if verbose:
             print("[gw] 未发现网关")
@@ -505,8 +535,14 @@ def discover_gateway(verbose=False):
     _save_cached_port(port)
     if verbose:
         print(f"[gw] 命中网关 127.0.0.1:{port}")
+    # 密钥有效性判定：live 完全查不到，或与心跳侧目标会话对不上，
+    # 都说明这份凭据/实例不可信 —— 上层会放弃继承环境重扫活进程。
+    degraded = (not live_sid) or bool(prefer_sid and live_sid != prefer_sid)
+    if degraded and verbose:
+        print(f"[gw] live={str(live_sid)} 与期望不符，凭据可能已过期")
     return {"base": f"http://127.0.0.1:{port}", "password": pw,
-            "pid": cred["pid"], "host": cred["host"], "cached": False}
+            "pid": cred["pid"], "host": cred["host"], "cached": False,
+            "degraded": degraded}
 
 
 if __name__ == "__main__":
