@@ -947,6 +947,11 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
             if he.code == 401:
                 return None                      # 密钥过期 -> 触发重发现
             return False, f"HTTP {he.code}"
+        except urllib.error.URLError:
+            # 连接层失败（拒绝/超时）：WorkBuddy 重启后网关会换端口，
+            # 而内存缓存还抱着旧端口 —— 实测踩过：缓存 5 分钟内一直打死
+            # 端口报 URLError。当成"需要重发现"处理，和 401 同路径。
+            return None, "URLError"
         except Exception as e:                    # noqa: BLE001
             return False, f"{type(e).__name__}"[:36]
 
@@ -955,7 +960,7 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
         if wait:
             time.sleep(wait)
         ok, msg = attempt(base, pw)
-        if ok is None:                            # 401：GUI 重启过，重新发现
+        if ok is None:                            # 401/URLError：GUI 重启过，重新发现
             base, pw = _discover(force=True)
             if not base:
                 return False, "Gateway offline"
