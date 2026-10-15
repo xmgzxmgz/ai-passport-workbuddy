@@ -1470,14 +1470,53 @@ def _pick_target_session(ble: BleCenter, idx: int):
     return None, "none"
 
 
+def _is_session_busy(sid):
+    """会话是否正忙（agent 在跑）。查本地 DB，只读。"""
+    if not sid:
+        return False
+    con = _read_db()
+    if con is None:
+        return False
+    try:
+        row = con.execute("SELECT status FROM sessions WHERE id = ?",
+                          (sid,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+    return bool(row) and row[0] == "working"
+
+
+_BUSY_WAIT_MAX = 90          # 最长等目标会话空闲的时间（秒）
+_BUSY_POLL = 3.0
+
+
 def _deliver(ble: BleCenter, idx: int, text: str):
     """真正投递一句话，并把回执推给工牌。"""
     sid, how = _pick_target_session(ble, idx)
+
+    # 实测大坑：向 status=working 的会话投递，网关返回 ok 但消息被静默
+    # 丢弃（run active:false，消息库里也没有）。空闲会话则正常显示并
+    # 触发回复。而用户的使用场景恰恰是对着正在干活的对话说话 —— 所以
+    # 这里等它空闲再投，设备屏幕停留 SENDING。
+    waited = 0.0
+    while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
+        if waited == 0.0:
+            print(f"[SEND] target busy, waiting idle: {str(sid)[:8]}",
+                  flush=True)
+        time.sleep(_BUSY_POLL)
+        waited += _BUSY_POLL
+
     ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble))
     if ok:
         ble.send(sent_frame(True, reply or "Sent"))
         ble.selected = idx
-        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how}", flush=True)
+        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how} "
+              f"(waited {waited:.0f}s)", flush=True)
+    elif _is_session_busy(sid):
+        print(f"[SEND] aborted, target still busy: {str(sid)[:8]}",
+              flush=True)
+        ble.send(sent_frame(False, "Session busy"))
     else:
         print(f"[SEND] failed ({how}): {reply}", flush=True)
         ble.send(sent_frame(False, reply))
