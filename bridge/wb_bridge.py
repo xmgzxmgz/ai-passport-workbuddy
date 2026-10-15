@@ -283,7 +283,19 @@ def clear_frame(what=0):
 # 数据源 A：sessions 心跳
 # ===========================================================================
 
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 def latest_heartbeat():
+    """最新的 GUI 交互会话心跳，返回 (lastHeartbeat_ms, cwd, sessionId)。
+
+    实测踩坑（本机 4 个心跳文件）：
+      * CLI host 子进程也会写心跳，cwd 含 cli_host、sessionId 根本不是
+        对话 id —— 不排除会把消息投进一个不存在的会话，屏幕毫无反应；
+      * 会话空闲时心跳间隔会拉长到 ~2 分钟，不能只认"几秒内"的心跳。
+    所以这里按 UUID 格式过滤 sessionId、排除 cli_host，取最新的那个。
+    """
     best = (None, None, None)
     for f in glob.glob(str(SESSIONS_DIR / "*.json")):
         try:
@@ -293,9 +305,14 @@ def latest_heartbeat():
             continue
         if d.get("kind") != "interactive":
             continue
+        sid = d.get("sessionId") or ""
+        if not _UUID_RE.match(str(sid)):
+            continue
+        if "cli_host" in str(d.get("cwd", "")):
+            continue
         hb = d.get("lastHeartbeat")
         if isinstance(hb, (int, float)) and (best[0] is None or hb > best[0]):
-            best = (hb, d.get("cwd", ""), d.get("sessionId", ""))
+            best = (hb, d.get("cwd", ""), sid)
     return best
 
 
@@ -1423,17 +1440,21 @@ def _dispatch(ble: BleCenter, cmd: int, pl: bytes):
 def _pick_target_session(ble: BleCenter, idx: int):
     """决定这句话投到哪个对话，返回 (session_id, 来源标签)。
 
-    投给"WorkBuddy 窗口里此刻开着的那一个"，GUI 才会有反应 —— 之前直接用
-    ble.convs[idx] 的 id，投递确实成功、文件里也落了字，但 GUI 不会因为一条
-    外部消息切过去，就成了"工牌显示 SENT，电脑却像没反应"。
+    投给"WorkBuddy 窗口里此刻开着的那一个"，GUI 才会有反应。
 
-    解析顺序（从免费到收费）：
-      1. 网关 /api/v1/sessions 里 isCurrent==true 的会话（一次认证请求，5s 缓存）
-      2. 网关 /status 的 activeSessionId（老网关才有；10s 缓存，多数返回 None）
-      3. 本地心跳文件 ~/.workbuddy/sessions/*.json 里最新心跳的 sessionId
-         —— 零网络请求、零配额，GUI 心跳 5s 一跳，实测最可靠
-      4. 设备选中的 conv id（最后兜底，可能"SENT 但窗口没反应"）
+    实机验证后的优先级（和直觉相反，本地心跳最准）：
+      1. 本地心跳 ~/.workbuddy/sessions/*.json 里最新的 GUI 会话
+         —— 零网络请求、零配额。空闲时心跳约 2 分钟一跳，容忍 180s。
+      2. 网关 /api/v1/sessions 里 isCurrent==true（本机实测列表里根本
+         不含 GUI 正开的会话，isCurrent 恒 False —— 仅作兜底）
+      3. 网关 /status 的 activeSessionId —— 实测语义是"最近有 run 的
+         会话"而不是"屏幕上开着的"，投进去 GUI 不切过去，用户毫无
+         感知（表现为 SENT 但窗口没反应）。只作最后兜底。
+      4. 设备选中的 conv id
     """
+    hb_at, _cwd, hb_sid = latest_heartbeat()
+    if hb_sid and hb_at and (time.time() * 1000 - hb_at) < 180_000:
+        return str(hb_sid), "heartbeat"
     for s in gateway_sessions(5):
         if s.get("isCurrent"):
             sid = s.get("id") or s.get("sessionId")
@@ -1442,9 +1463,6 @@ def _pick_target_session(ble: BleCenter, idx: int):
     active = gateway_active_session()
     if active:
         return str(active), "active"
-    hb_at, _cwd, hb_sid = latest_heartbeat()
-    if hb_sid and hb_at and (time.time() * 1000 - hb_at) < 15_000:
-        return str(hb_sid), "heartbeat"
     if 0 <= idx < len(ble.convs):
         return ble.convs[idx]["id"], "device"
     if ble.convs:
