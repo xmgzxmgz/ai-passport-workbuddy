@@ -1506,18 +1506,56 @@ def _pick_target_session(ble: BleCenter, idx: int):
     return None, "none"
 
 
+def _is_session_busy(sid):
+    """会话是否正忙（agent 在跑）。查本地 DB，只读、零配额。"""
+    if not sid:
+        return False
+    con = _read_db()
+    if con is None:
+        return False
+    try:
+        row = con.execute("SELECT status FROM sessions WHERE id = ?",
+                          (sid,)).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+    return bool(row) and row[0] == "working"
+
+
+_BUSY_WAIT_MAX = 120         # 最长等目标会话空闲的时间（秒）
+_BUSY_POLL = 3.0
+
+
 def _deliver(ble: BleCenter, idx: int, text: str):
     """真正投递一句话，并把回执推给工牌。
 
-    reply 端点不挑忙碌状态（writerOccupied=true 实测照常投递），
-    之前"等空闲 90s"的等待逻辑基于 runs 端点的错误认知，已删除。
+    ⚠️ 实测（11:44，有 jsonl 证据）：reply 端点对忙碌会话返回
+    delivered:true 但消息**静默丢弃**（消息文件零痕迹）；只有空闲
+    窗口才真正落库（「测试语音收录。」在我回复间隙投递成功落库，
+    「测试语音输入。」在我处理中投递被丢）。GUI 自己的输入队列在
+    内存里，外部够不着 —— 所以只能等空闲再投。
     """
     sid, how = _pick_target_session(ble, idx)
+
+    waited = 0.0
+    while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
+        if waited == 0.0:
+            print(f"[SEND] target busy, waiting idle: {str(sid)[:8]}",
+                  flush=True)
+        time.sleep(_BUSY_POLL)
+        waited += _BUSY_POLL
+
     ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble))
     if ok:
         ble.send(sent_frame(True, reply or "Sent"))
         ble.selected = idx
-        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how}", flush=True)
+        print(f"[SEND] ok -> conv={str(sid)[:8]} via {how} "
+              f"(waited {waited:.0f}s)", flush=True)
+    elif _is_session_busy(sid):
+        print(f"[SEND] aborted, target still busy: {str(sid)[:8]}",
+              flush=True)
+        ble.send(sent_frame(False, "Session busy"))
     else:
         print(f"[SEND] failed ({how}): {reply}", flush=True)
         ble.send(sent_frame(False, reply))
