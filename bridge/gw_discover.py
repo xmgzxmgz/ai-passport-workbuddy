@@ -370,32 +370,39 @@ def _is_gateway_unauthed(port: int, timeout=1.2) -> bool:
         return False
 
 
-def find_gateway_port(password=None, timeout=1.2):
-    """定位网关端口。
+def find_gateway_ports(password=None, timeout=1.2):
+    """返回**所有**网关实例端口。
 
-    只返回一个端口。多个候选时（WorkBuddy 会同时开好几个本地服务，实测 macOS 上
-    能扫到 4 个都返回 401 的），用密钥做一次性地甄别，挑真正返回 status=ok 的那个
-    —— 这一步会消耗配额，但只在发现阶段发生一次，之后走缓存。
+    实机发现：GUI 和各 CLI 会话会各起一个网关实例，只返回一个会抓错
+    （抓到 CLI 的，live=null，投递一律无效）。上层用 /sessions/live 甄别。
     """
     from concurrent.futures import ThreadPoolExecutor
 
     ports = listening_ports()
     if not ports:
-        return None
+        return []
 
     with ThreadPoolExecutor(max_workers=min(32, len(ports))) as pool:
         verdicts = list(pool.map(_is_gateway_unauthed, ports))
     candidates = sorted(p for p, ok in zip(ports, verdicts) if ok)
 
     if len(candidates) <= 1:
-        return candidates[0] if candidates else None
-
+        return candidates
     if password:
-        for p in candidates:
-            if probe_gateway(f"http://127.0.0.1:{p}", password) is not None:
-                return p
-    # 没带密钥就退回第一个候选，交给上层用真实请求去证伪
-    return candidates[0]
+        # 多候选时用密钥甄别（消耗一次配额，仅发现阶段发生）
+        return [p for p in candidates
+                if probe_gateway(f"http://127.0.0.1:{p}", password) is not None]
+    return candidates
+
+
+def find_gateway_port(password=None, timeout=1.2):
+    """定位网关端口（返回第一个候选）。
+
+    .. deprecated:: 多实例场景下请用 find_gateway_ports + live 甄别，
+       见 discover_gateway。
+    """
+    ports = find_gateway_ports(password=password, timeout=timeout)
+    return ports[0] if ports else None
 
 
 # ===========================================================================
@@ -427,11 +434,34 @@ def _save_cached_port(port):
 # 对外主入口
 # ===========================================================================
 
+def _live_session_on(port: int, password: str, timeout=1.5):
+    """该端口网关的 /api/v1/sessions/live sessionId。
+
+    非网关、密钥不符或当前无活会话都返回 None。
+    实机发现：本机会同时存在多个网关实例（GUI 一个、各 CLI 会话各一个），
+    只有 GUI 那个的 live 非空 —— 这是甄别实例的唯一可靠特征。
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v1/sessions/live",
+        headers={"Authorization": f"Bearer {password}",
+                 "X-CodeBuddy-Request": "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:                                 # noqa: BLE001
+        return None
+    return ((body or {}).get("data") or {}).get("sessionId") or None
+
+
 def discover_gateway(verbose=False):
     """完整发现：读凭据 -> 定位端口 -> 组装 base。
 
     返回 {"base","password","pid","host"} 或 None。
     端口每次 GUI 启动随机分配，但缓存后可直接命中，避免反复扫描。
+
+    实机踩坑：本机可能同时有多个网关实例（GUI + 各 CLI 会话），扫到的
+    第一个很可能是 CLI 的（live=null），投递给它一律 409/无效。所以
+    候选多于一个时，用 /sessions/live 非空来甄别 GUI 实例。
     """
     cred = find_gateway()
     if not cred:
@@ -443,18 +473,30 @@ def discover_gateway(verbose=False):
         return None
     pw = cred["password"]
 
-    # 1) 缓存端口快路径：确认它还是那个网关（依旧不带认证）
+    def pick(cands):
+        """从候选端口里挑 GUI 实例（live 非空）；全空则返回第一个。"""
+        for p in cands:
+            sid = _live_session_on(p, pw)
+            if sid:
+                if verbose:
+                    print(f"[gw] {p} live={str(sid)[:8]} <- GUI 网关")
+                return p
+        return cands[0] if cands else None
+
     cached = _load_cached_port()
     if cached and _is_gateway_unauthed(cached):
-        if verbose:
-            print(f"[gw] 端口缓存命中 {cached}")
-        return {"base": f"http://127.0.0.1:{cached}", "password": pw,
-                "pid": cred["pid"], "host": cred["host"], "cached": True}
+        port = pick([cached])
+        if port and _live_session_on(port, pw):
+            if verbose:
+                print(f"[gw] 端口缓存命中 {cached}")
+            return {"base": f"http://127.0.0.1:{port}", "password": pw,
+                    "pid": cred["pid"], "host": cred["host"], "cached": True}
+        # 缓存实例存在但 live 为空（可能是 CLI 网关）—— 继续扫描更好的
 
-    # 2) 全端口扫描
     if verbose:
         print(f"[gw] 扫描 {len(listening_ports())} 个本地端口（无认证）…")
-    port = find_gateway_port(password=pw)
+    ports = find_gateway_ports(password=pw)
+    port = pick(ports) if ports else None
     if not port:
         if verbose:
             print("[gw] 未发现网关")

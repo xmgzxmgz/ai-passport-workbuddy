@@ -982,6 +982,16 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
             _GW_ACTIVE.update(sid=None, at=0.0)
             live = gateway_active_session()
             if not live:
+                # live 为空可能是抓到了 CLI 网关实例（本机多实例并存，
+                # CLI 实例 live 恒 null）—— 强制重发现，发现逻辑会挑
+                # live 非空的 GUI 实例
+                b2, p2 = _discover(force=True)
+                if not b2:
+                    return False, "No active session"
+                b, p = b2, p2
+                _GW_ACTIVE.update(sid=None, at=0.0)
+                live = gateway_active_session()
+            if not live:
                 return False, "No active session"
             if live == target:
                 return False, "Not live (live==target)"
