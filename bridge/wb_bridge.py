@@ -798,7 +798,11 @@ def transcribe(wav_path: Path):
 # 会一直停在 "Authentication required" 上（实测永久卡死，无超时价值）。
 
 _GW = {"base": None, "password": None, "at": 0.0, "active": None}
-_GW_TTL = 1800.0          # GUI 不重启则端口/密钥不变，缓存半小时
+_GW_TTL = 60.0
+# ⚠️ 2026-10-15 实测推翻旧结论（"GUI 不重启则端口/密钥不变，缓存半小时"）：
+# WorkBuddy 会**每轮对话运行都重启会话网关**（端口 55524→61498→63990→53779，
+# 一天四变），缓存长了必定打死旧端口。密钥本身是每次 app 启动共享的
+# （一个密钥可认证全部实例），所以短缓存 + 现查路由是唯一安全姿势。
 _SENDER_ID = "aipassport"  # 网关限流按 sender.id 分桶，默认桶名
 
 
@@ -882,26 +886,38 @@ _GW_SESS_TTL = 5.0
 
 
 _ROUTE = {"sid": None, "at": 0.0, "route": None}
-_ROUTE_TTL = 15.0
+_ROUTE_TTL = 15.0         # 命中缓存
+_ROUTE_MISS_TTL = 2.0     # 失败只缓存 2s：网关重绑定窗口内要能快速重试
 
 
 def _route_to_instance(sid, force=False):
     """找到 live 恰好等于 sid 的网关实例，返回 (base, pw) 或 (None, None)。
 
-    2026-10-15 实机踩坑：两个 WorkBuddy 窗口 = 两个网关实例，默认发现
-    会抓错实例 —— 用户选了 A 对话，消息却投进 B 窗口的会话。多实例下
-    必须按「对话 -> live 匹配的实例」路由，而不是随便挑一个网关。
+    2026-10-15 实机踩坑（两个）：
+      * 两个 WorkBuddy 窗口 = 两个网关实例，默认发现会抓错实例 ——
+        用户选了 A 对话，消息却投进 B 窗口的会话。多实例下必须按
+        「对话 -> live 匹配的实例」路由；
+      * WorkBuddy 每轮运行都会重启会话网关（端口一天四变），发送
+        瞬间撞上重绑定窗口会找不到匹配实例 —— 调用方需带重试。
     """
     now = time.monotonic()
-    if (not force) and _ROUTE["sid"] == sid and now - _ROUTE["at"] < _ROUTE_TTL:
-        return _ROUTE["route"]
+    if (not force) and _ROUTE["sid"] == sid:
+        ttl = _ROUTE_TTL if _ROUTE["route"][0] else _ROUTE_MISS_TTL
+        if now - _ROUTE["at"] < ttl:
+            return _ROUTE["route"]
     route = (None, None)
     try:
         import gw_discover
-        for inst in gw_discover.discover_instances(prefer_sid=sid):
+        insts = gw_discover.discover_instances(prefer_sid=sid)
+        for inst in insts:
             if inst["live_sid"] == sid:
                 route = (inst["base"], inst["password"])
                 break
+        if not route[0]:
+            # 失败时把看到的实例都打出来，方便事后诊断
+            for inst in insts:
+                print(f"[GW]   cand {inst['base']} "
+                      f"live={str(inst['live_sid'])[:8]}", flush=True)
     except Exception as e:                        # noqa: BLE001
         print(f"[GW] route failed: {type(e).__name__}: {e}", flush=True)
     _ROUTE.update(sid=sid, at=now, route=route)
@@ -1075,6 +1091,12 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None,
             if not base:
                 return False, "Gateway offline"
             ok, msg = attempt(base, pw, session_id)
+        elif not ok and msg == "Not live (picked conv)":
+            # strict 409：可能投递瞬间网关恰好重绑定 —— 强制重路由一次
+            nb, npw = _route_to_instance(session_id, force=True)
+            if nb:
+                base, pw = nb, npw
+                ok, msg = attempt(base, pw, session_id)
         if ok:
             return True, "Sent"
         last = (ok, msg)
@@ -1598,14 +1620,26 @@ def _deliver(ble: BleCenter, idx: int, text: str):
         print("[SEND] no target session", flush=True)
         ble.push_all()
         return
-    if how == "device" and not route[0]:
-        # 工牌明确选中的对话不是任何实例的 live（窗口没开着它）
-        # —— 如实报错。绝不改投别的对话（2026-10-15 踩坑）。
-        ble.send(sent_frame(False, "Conv not in live window"))
-        print(f"[SEND] device-picked conv {str(sid)[:8]} is not live "
-              f"on any instance", flush=True)
-        ble.push_all()
-        return
+    if how == "device":
+        # WorkBuddy 每轮运行都重启会话网关（端口一天四变），发送瞬间
+        # 可能正处旧端口已死、新端口未就绪的重绑定窗口 —— 重试等待，
+        # 而不是立刻报错（2026-10-15 实测：5 连败全是撞上这个窗口）。
+        retries = 0
+        while not route[0] and retries < 4:
+            if retries == 0:
+                print(f"[SEND] conv {str(sid)[:8]} not routed yet, "
+                      f"retrying (gateway rebinding?)", flush=True)
+            time.sleep(3.0)
+            route = _route_to_instance(sid, force=True)
+            retries += 1
+        if not route[0]:
+            # 工牌明确选中的对话确实不是任何实例的 live —— 如实报错。
+            # 绝不改投别的对话（2026-10-15 踩坑）。
+            ble.send(sent_frame(False, "Conv not in live window"))
+            print(f"[SEND] device-picked conv {str(sid)[:8]} is not live "
+                  f"on any instance (after {retries} retries)", flush=True)
+            ble.push_all()
+            return
 
     waited = 0.0
     while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
