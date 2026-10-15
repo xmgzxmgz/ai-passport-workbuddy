@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.nck.wbbridge</string>
+    <key>CFBundleName</key>
+    <string>WBBridge</string>
+    <key>CFBundleExecutable</key>
+    <string>wb-bridge</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
+</dict>
+</plist>

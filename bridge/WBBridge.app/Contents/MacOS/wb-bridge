@@ -1,0 +1,10 @@
+#!/bin/zsh
+# WBBridge.app 启动器：真正的逻辑在 wb_bridge.py
+# 之所以要套一层 .app：macOS 要求访问 CoreBluetooth 的进程必须带
+# NSBluetoothAlwaysUsageDescription，裸 python 解释器没有 -> 一碰蓝牙
+# 就被系统 SIGKILL。这个壳声明了权限，TCC 会把蓝牙授权记在 app 上。
+LOG="$HOME/.workbuddy/wb_bridge.log"
+BRIDGE_DIR="/Users/xiamuguizhi/WorkBuddy/2026-10-15-08-59-10/ai-passport-workbuddy/bridge"
+PY="/Users/xiamuguizhi/.workbuddy/binaries/python/envs/default/bin/python"
+echo "=== $(date) launcher start ===" >> "$LOG"
+cd "$BRIDGE_DIR" && exec "$PY" -u wb_bridge.py >> "$LOG" 2>&1
