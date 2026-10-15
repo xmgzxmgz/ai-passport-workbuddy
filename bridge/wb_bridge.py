@@ -1884,11 +1884,14 @@ def handle_voice_send(ble: BleCenter, idx: int, mode: int = SEND_AUTO):
 def handle_confirm(ble: BleCenter, idx: int):
     """工牌在确认屏上按了 OK：投递刚才缓存的那份转写。
 
-    投递文本加 [语音] 前缀：GUI 对外部注入的消息不渲染实时气泡
-    （逆向结论：用户气泡只由 GUI 自己发送时本地绘制，agent 侧
-    runDefault 不向 GUI 流发 user_message_chunk），所以对话里
-    只能看到回复看不到原话 —— 前缀让 Agent 与回放历史里都能
-    一眼识别这是工牌语音。
+    投递文本加 [语音] 前缀，纯属标记：一眼看出这句来自工牌。
+
+    注（2026-10-15 15:23 修正）：曾以为 GUI 不渲染外部注入的气泡，
+    并因此把前缀当"缓解手段" —— 那个结论是错的。当时依据的 14:17
+    那次 reply 返回 delivered:true 但消息**从未落库**（假成功），
+    对话里当然什么都没有。端到端验收（verify_live.py）证明：只要
+    消息真正写进会话记录，GUI 就会正常把它渲染成用户气泡。
+    因此前缀现在只是来源标记，删掉不影响投递与显示。
     """
     text = ble.pending_text
     if not text:
