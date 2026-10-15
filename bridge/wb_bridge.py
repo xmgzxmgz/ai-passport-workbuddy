@@ -1265,16 +1265,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send({"ok": bool(_BLE and _BLE.connected)})
 
             elif p == "/send":
-                # 诊断：跳过 ASR，直接把文本经网关发给指定对话
-                #   /send?text=hello[&conv=<sessionId>][&sender=<bucket>]
+                # 诊断：跳过 ASR，直接把文本经网关投给指定对话
+                #   /send?text=hi[&conv=<sessionId>][&sender=<bucket>][&wait=秒]
+                # conv 是**会话 id**；省略或传 0 则用 live/心跳兜底选会话。
+                # 诊断接口同样走严格路由 + 落库验真，不再跨窗口改投
+                # （2026-10-15 踩坑：旧版把 conv=0 当会话 id，409 后
+                #   静默改投到了另一个窗口的会话）。
                 text = (q.get("text") or [""])[0]
                 conv = (q.get("conv") or [None])[0]
                 sender = (q.get("sender") or [None])[0]
+                try:
+                    wait = float((q.get("wait") or ["20"])[0])
+                except ValueError:
+                    wait = 20.0
                 t0 = time.time()
-                ok, msg = send_to_workbuddy(conv, text, sender_id=sender)
+                if conv and conv != "0":
+                    sid, how = str(conv), "device"
+                    route = _route_to_instance(sid, force=True)
+                    if not route[0]:
+                        self._send({"ok": False, "conv": sid,
+                                    "message": "Conv not in live window"})
+                        return
+                else:
+                    sid, how, route = (_pick_target_session(_BLE, -1) if _BLE
+                                       else (None, "none", (None, None)))
+                ok, msg, detail = deliver_text(sid, text, how=how, route=route,
+                                               sender_id=sender,
+                                               wait_max=wait)
                 self._send({"ok": ok, "message": msg,
                             "elapsed": round(time.time() - t0, 2),
-                            "conv": conv, "gateway": _GW.get("base")})
+                            "conv": str(sid), "how": how,
+                            "attempts": detail["attempts"],
+                            "waited": round(detail["waited"], 1),
+                            "gateway": _GW.get("base")})
 
             else:
                 self._send({"error": "not_found", "path": p}, 404)
@@ -1613,8 +1636,134 @@ def _is_session_busy(sid):
     return bool(row) and row[0] == "working"
 
 
-_BUSY_WAIT_MAX = 120         # 最长等目标会话空闲的时间（秒）
+_BUSY_WAIT_MAX = 600         # 最长等目标会话空闲的时间（秒）
 _BUSY_POLL = 3.0
+_VERIFY_WAIT = 12.0          # 投递后回读会话记录、确认真的落库的等待上限（秒）
+_MAX_ATTEMPTS = 12           # 单轮投递最多尝试次数（防重复轰炸）
+
+
+def _session_jsonl(sid):
+    """按 sessionId 定位会话记录文件 projects/<cwd-slug>/<sid>.jsonl。"""
+    if not sid:
+        return None
+    hits = glob.glob(str(PROJECTS_DIR / "*" / f"{sid}.jsonl"))
+    if not hits:
+        return None
+    hits.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+              reverse=True)
+    return hits[0]
+
+
+def _line_count(path):
+    """记录当前行数做基线：只认投递之后**新增**的行。"""
+    if not path:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return len(fh.read().splitlines())
+    except OSError:
+        return 0
+
+
+def _needle(text):
+    """从待投递文本里取指纹：去掉 [语音] 前缀后的正文。"""
+    s = (text or "").strip()
+    if s.startswith("[语音]"):
+        s = s.split("]", 1)[-1].strip()
+    return s[:60]
+
+
+def _verify_landed(sid, text, baseline):
+    """回读会话记录，确认这话真的写进去了。
+
+    实测踩坑（2026-10-15 14:17）：reply 对忙碌会话返回 delivered:true，
+    日志打 `SEND ok`，但会话 jsonl 里一个字都没有 —— 只信回执会把
+    假成功当成功。所以投递后必须回读记录验真。
+
+    只认 `type=message & role=user` 的行：本进程自己的命令输出/日志也会
+    被写进同一个 jsonl（function_call_result），纯文本子串匹配会被自污染。
+    """
+    path = _session_jsonl(sid)
+    needle = _needle(text)
+    if not path or not needle:
+        return False
+    deadline = time.time() + _VERIFY_WAIT
+    while True:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        for ln in lines[baseline:]:
+            if needle not in ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if d.get("type") != "message" or d.get("role") != "user":
+                continue
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.8)
+
+
+def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
+                 wait_max=_BUSY_WAIT_MAX, on_status=None):
+    """核心投递：等空闲 -> 投 -> 回读验真 -> 没落库就重试。
+
+    返回 (ok, 回执文本, 明细)。明细含 attempts / waited / busy。
+    on_status(text) 可选，用于把"排队中"这类中间态推给工牌。
+
+    实测（2026-10-15，bridge 日志 × 会话 jsonl 对账）：只有会话空闲时
+    投递才真正落库；忙碌期 reply 返回 delivered:true 但消息**静默丢弃**。
+    所以必须 ① 等到空闲 ② 投完回读记录验真 ③ 没落库就再来一轮。
+    """
+    detail = {"attempts": 0, "waited": 0.0, "busy": False}
+    if not sid:
+        return False, "No active session", detail
+
+    if _is_session_busy(sid):
+        detail["busy"] = True
+        if on_status:
+            on_status("Queued")
+        print(f"[SEND] target busy, queued & waiting idle: {str(sid)[:8]}",
+              flush=True)
+
+    deadline = time.time() + max(wait_max, 0.0)
+    verified = False
+    last = (False, "unknown")
+    while detail["attempts"] < _MAX_ATTEMPTS:
+        # 等目标会话空闲（wait_max=0 时立刻只投一次，给诊断接口用）
+        if _is_session_busy(sid) and time.time() < deadline:
+            t_busy = time.time()
+            while _is_session_busy(sid) and time.time() < deadline:
+                time.sleep(_BUSY_POLL)
+            detail["waited"] += time.time() - t_busy
+        detail["attempts"] += 1
+        if how == "device" and detail["attempts"] > 1:
+            # 网关每轮运行都重绑端口，重试前重新确认按对话路由
+            r2 = _route_to_instance(sid, force=True)
+            if r2 and r2[0]:
+                route = r2
+        baseline = _line_count(_session_jsonl(sid))
+        ok, reply = send_to_workbuddy(sid, text, sender_id=sender_id,
+                                      route=route, strict=(how == "device"))
+        last = (ok, reply)
+        if ok and _verify_landed(sid, text, baseline):
+            verified = True
+            break
+        print(f"[SEND] attempt {detail['attempts']}: ok={ok} reply={reply!r} "
+              f"未落库 -> 重试", flush=True)
+        if time.time() >= deadline:
+            break
+        time.sleep(2.5)
+
+    if verified:
+        return True, "Sent", detail
+    detail["busy"] = _is_session_busy(sid)
+    return False, last[1], detail
 
 
 def _deliver(ble: BleCenter, idx: int, text: str):
@@ -1625,6 +1774,9 @@ def _deliver(ble: BleCenter, idx: int, text: str):
     窗口才真正落库（「测试语音收录。」在我回复间隙投递成功落库，
     「测试语音输入。」在我处理中投递被丢）。GUI 自己的输入队列在
     内存里，外部够不着 —— 所以只能等空闲再投。
+
+    2026-10-15 补强：投递后**回读会话记录验真**（_verify_landed），
+    没落库就当失败重来 —— 只信 reply 的 delivered 回执会吞掉假成功。
     """
     sid, how, route = _pick_target_session(ble, idx)
     if not sid:
@@ -1653,28 +1805,27 @@ def _deliver(ble: BleCenter, idx: int, text: str):
             ble.push_all()
             return
 
-    waited = 0.0
-    while _is_session_busy(sid) and waited < _BUSY_WAIT_MAX:
-        if waited == 0.0:
-            print(f"[SEND] target busy, waiting idle: {str(sid)[:8]}",
-                  flush=True)
-        time.sleep(_BUSY_POLL)
-        waited += _BUSY_POLL
+    # ---- 等空闲 -> 投递 -> 回读验真（核心在 deliver_text）----
+    def _progress(t):
+        ble.send(sent_frame(True, t))
+        ble.push_all()
 
-    ok, reply = send_to_workbuddy(sid, text, sender_id=_device_sender(ble),
-                                  route=route, strict=(how == "device"))
+    ok, msg, detail = deliver_text(sid, text, how=how, route=route,
+                                   sender_id=_device_sender(ble),
+                                   on_status=_progress)
     if ok:
-        ble.send(sent_frame(True, reply or "Sent"))
+        ble.send(sent_frame(True, "Sent"))
         ble.selected = idx
         print(f"[SEND] ok -> conv={str(sid)[:8]} via {how} "
-              f"(waited {waited:.0f}s)", flush=True)
-    elif _is_session_busy(sid):
-        print(f"[SEND] aborted, target still busy: {str(sid)[:8]}",
+              f"(attempts {detail['attempts']}, waited {detail['waited']:.0f}s)",
               flush=True)
+    elif detail.get("busy"):
+        print(f"[SEND] aborted, target still busy: {str(sid)[:8]}", flush=True)
         ble.send(sent_frame(False, "Session busy"))
     else:
-        print(f"[SEND] failed ({how}): {reply}", flush=True)
-        ble.send(sent_frame(False, reply))
+        print(f"[SEND] failed ({how}) after {detail['attempts']} attempts: "
+              f"{msg}", flush=True)
+        ble.send(sent_frame(False, msg or "Not delivered"))
     ble.push_all()
 
 
