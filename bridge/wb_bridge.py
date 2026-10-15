@@ -1615,7 +1615,14 @@ def handle_voice_send(ble: BleCenter, idx: int, mode: int = SEND_AUTO):
 
 
 def handle_confirm(ble: BleCenter, idx: int):
-    """工牌在确认屏上按了 OK：投递刚才缓存的那份转写。"""
+    """工牌在确认屏上按了 OK：投递刚才缓存的那份转写。
+
+    投递文本加 [语音] 前缀：GUI 对外部注入的消息不渲染实时气泡
+    （逆向结论：用户气泡只由 GUI 自己发送时本地绘制，agent 侧
+    runDefault 不向 GUI 流发 user_message_chunk），所以对话里
+    只能看到回复看不到原话 —— 前缀让 Agent 与回放历史里都能
+    一眼识别这是工牌语音。
+    """
     text = ble.pending_text
     if not text:
         ble.send(sent_frame(False, "Nothing to send"))
@@ -1625,7 +1632,7 @@ def handle_confirm(ble: BleCenter, idx: int):
     if idx < 0:
         idx = ble.pending_idx
     print(f"[CONFIRM] accepted idx={idx}", flush=True)
-    _deliver(ble, idx, text)
+    _deliver(ble, idx, f"[语音] {text}")
 
 
 # ===========================================================================
