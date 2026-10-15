@@ -457,13 +457,38 @@ def _live_session_on(port: int, password: str, timeout=1.5):
     return ((body or {}).get("data") or {}).get("sessionId") or None
 
 
+def _owner_session_on(port: int, password: str, timeout=1.5):
+    """该端口网关 /status 的 activeSessionId —— 网关所属窗口的会话。
+
+    2026-10-15 实测关键发现：/sessions/live 只在有 writer 附着（agent
+    run 进行中）时非空，**会话空闲时全实例 live=None** —— 按 live 路由
+    在空闲期必然失联（工牌消息恰恰多发于空闲期）。/status 的
+    activeSessionId 稳定标识该网关归属哪个会话，空闲时也在，作为兜底
+    路由键。无该字段的实例（CLI host）返回 None。
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v1/status",
+        headers={"Authorization": f"Bearer {password}",
+                 "X-CodeBuddy-Request": "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:                                 # noqa: BLE001
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if isinstance(data, dict):
+        return data.get("activeSessionId") or None
+    return None
+
+
 def discover_instances(verbose=False, prefer_sid=None):
     """发现**所有**认证可用的网关实例，返回实例列表。
 
-    每项 {"base","password","pid","host","live_sid"}；live 恰好等于
-    prefer_sid 的排最前（调用方用它做按对话路由）。全部端口都认证
-    不过时自动放弃自环境密钥、改扫活进程重试（2026-10-15 踩坑：
-    会话压缩后继承密钥过期）。
+    每项 {"base","password","pid","host","live_sid","owner_sid"}：
+      * live_sid：/sessions/live（writer 附着时非空，权威）
+      * owner_sid：/status 的 activeSessionId（空闲时也在，兜底）
+    排序：live==prefer_sid > owner==prefer_sid > live 非空 > 其余。
+    全部端口都认证不过时自动放弃自环境密钥、改扫活进程重试。
     """
     for skip_self in (False, True):
         cred = find_gateway(skip_self=skip_self)
@@ -473,28 +498,40 @@ def discover_instances(verbose=False, prefer_sid=None):
             continue
         pw = cred["password"]
         ports = find_gateway_ports(password=pw)
-        insts = [{"base": f"http://127.0.0.1:{p}", "password": pw,
-                  "pid": cred["pid"], "host": cred["host"],
-                  "live_sid": _live_session_on(p, pw)} for p in ports]
+        insts = []
+        for p in ports:
+            live = _live_session_on(p, pw)
+            owner = live if live else _owner_session_on(p, pw)
+            insts.append({"base": f"http://127.0.0.1:{p}", "password": pw,
+                          "pid": cred["pid"], "host": cred["host"],
+                          "live_sid": live, "owner_sid": owner})
         if not insts:
             # 这份密钥一个端口都认证不过 -> 下一轮 skip_self 扫活进程
             if verbose:
                 print(f"[gw] 密钥(pid={cred['pid']})对 {len(ports)} 个候选"
                       f"全失败" if ports else f"[gw] 无候选端口")
             continue
-        good = [i for i in insts if i["live_sid"]]
-        if prefer_sid:
-            good.sort(key=lambda i: 0 if i["live_sid"] == prefer_sid else 1)
-        ordered = good + [i for i in insts if not i["live_sid"]]
-        if good:
+
+        def rank(i):
+            if prefer_sid:
+                if i["live_sid"] == prefer_sid:
+                    return 0
+                if i["owner_sid"] == prefer_sid:
+                    return 1
+            return 2 if i["live_sid"] else 3
+
+        insts.sort(key=rank)
+        if insts and insts[0]["owner_sid"]:
             try:
-                _save_cached_port(int(ordered[0]["base"].rsplit(":", 1)[1]))
+                _save_cached_port(
+                    int(insts[0]["base"].rsplit(":", 1)[1]))
             except (ValueError, IndexError):
                 pass
         if verbose:
-            for i in ordered:
-                print(f"[gw] instance {i['base']} live={str(i['live_sid'])[:8]}")
-        return ordered
+            for i in insts:
+                print(f"[gw] instance {i['base']} live="
+                      f"{str(i['live_sid'])[:8]} owner={str(i['owner_sid'])[:8]}")
+        return insts
     return []
 
 

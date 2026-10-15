@@ -906,25 +906,37 @@ def _route_to_instance(sid, force=False):
         if now - _ROUTE["at"] < ttl:
             return _ROUTE["route"]
     route = (None, None)
+    how_matched = "none"
     try:
         import gw_discover
         insts = gw_discover.discover_instances(prefer_sid=sid)
+        # 两级匹配：live（权威，writer 附着中）> owner（/status 归属，
+        # 空闲期唯一可用 —— 2026-10-15 实测空闲时全实例 live=None）
         for inst in insts:
             if inst["live_sid"] == sid:
                 route = (inst["base"], inst["password"])
+                how_matched = "live"
                 break
+        if not route[0]:
+            for inst in insts:
+                if inst["owner_sid"] == sid:
+                    route = (inst["base"], inst["password"])
+                    how_matched = "owner"
+                    break
         if not route[0]:
             # 失败时把看到的实例都打出来，方便事后诊断
             for inst in insts:
-                print(f"[GW]   cand {inst['base']} "
-                      f"live={str(inst['live_sid'])[:8]}", flush=True)
+                print(f"[GW]   cand {inst['base']} live="
+                      f"{str(inst['live_sid'])[:8]} "
+                      f"owner={str(inst['owner_sid'])[:8]}", flush=True)
     except Exception as e:                        # noqa: BLE001
         print(f"[GW] route failed: {type(e).__name__}: {e}", flush=True)
     _ROUTE.update(sid=sid, at=now, route=route)
     if route[0]:
-        print(f"[GW] routed {str(sid)[:8]} -> {route[0]}", flush=True)
+        print(f"[GW] routed {str(sid)[:8]} -> {route[0]} ({how_matched})",
+              flush=True)
     else:
-        print(f"[GW] no instance live=={str(sid)[:8]}", flush=True)
+        print(f"[GW] no instance live/owner=={str(sid)[:8]}", flush=True)
     return route
 
 
