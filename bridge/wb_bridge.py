@@ -811,7 +811,12 @@ _gw_lock = threading.Lock()
 
 
 def _discover(force=False):
-    """惰性发现网关，缓存 5 分钟。返回 (base, password)。"""
+    """惰性发现网关，缓存 5 分钟。返回 (base, password)。
+
+    注意 find_gateway() 读不到密钥（如 GUI 正在重启、网关 sidecar 尚未
+    拉起）时 discover_gateway() 返回 None 且不抛异常 —— 必须打日志，
+    否则就是静默失败（实测踩过：用户按 OK 时撞上 GUI 重启窗口期）。
+    """
     with _gw_lock:
         if (not force) and _GW["base"] and (time.time() - _GW["at"] < _GW_TTL):
             return _GW["base"], _GW["password"]
@@ -827,6 +832,8 @@ def _discover(force=False):
             print(f"[GW] {info['base']} pid={info['pid']} "
                   f"cached={info.get('cached')}", flush=True)
             return _GW["base"], _GW["password"]
+        print("[GW] discover: no gateway found "
+              "(GUI 重启中或 sidecar 未拉起，下轮重试)", flush=True)
         _GW.update(base=None, password=None, at=time.time())
         return None, None
 
@@ -956,7 +963,15 @@ def send_to_workbuddy(session_id, text, timeout=25, sender_id=None):
     sender = sender_id or _SENDER_ID
     base, pw = _discover()
     if not base:
-        return False, "Gateway offline"
+        # 撞上 GUI 重启窗口期（sidecar 未拉起）时短暂等待再试一次，
+        # 别把 "Gateway offline" 直接甩给用户（实测踩过）。
+        for _ in range(3):
+            time.sleep(3.0)
+            base, pw = _discover(force=True)
+            if base:
+                break
+        if not base:
+            return False, "Gateway offline"
 
     def attempt(b, p, target):
         try:
