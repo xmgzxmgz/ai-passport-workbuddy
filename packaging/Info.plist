@@ -2,40 +2,40 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleIdentifier</key>
-	<string>com.nck.wbbridge</string>
-	<key>CFBundleName</key>
-	<string>WBBridge</string>
 	<key>CFBundleDisplayName</key>
 	<string>WBBridge 工牌中转</string>
 	<key>CFBundleExecutable</key>
 	<string>WBBridge</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleSignature</key>
-	<string>????</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.nck.wbbridge</string>
+	<key>CFBundleName</key>
+	<string>WBBridge</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.2.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
-	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>语音由工牌采集后经 BLE 传到本机，本机不做录音</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>AI Passport 工牌通过 BLE 与本机中转服务通信</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>语音由工牌采集后经 BLE 传到本机，本机不做录音</string>
 </dict>
 </plist>

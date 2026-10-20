@@ -2096,7 +2096,7 @@ def _needle(text):
     return s[:60]
 
 
-def _verify_landed(sid, text, baseline):
+def _verify_landed(sid, text, baseline, wait=None):
     """回读会话记录，确认这话真的写进去了。
 
     实测踩坑（2026-10-15 14:17）：reply 对忙碌会话返回 delivered:true，
@@ -2110,7 +2110,7 @@ def _verify_landed(sid, text, baseline):
     needle = _needle(text)
     if not path or not needle:
         return False
-    deadline = time.time() + _VERIFY_WAIT
+    deadline = time.time() + (wait if wait is not None else _VERIFY_WAIT)
     while True:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -2213,6 +2213,54 @@ def _reply_raw(base, pw, sid, text, timeout=25):
     return (200, "delivered") if delivered else (500, str(payload)[:60])
 
 
+def _acp_try_deliver(sid, text, baseline, max_wait=45.0):
+    """全实例 409 后的第二条路：ACP 通道（不依赖任何窗口焦点）。
+
+    消息在 Agent 开始处理时就写进会话 jsonl，所以不必等 session/prompt 的
+    end_turn（几十 MB 的大会话可能要一两分钟）。开线程发、主线程边等边
+    回读验真：验真先成功就立刻返回，ACP 先失败也立刻返回 —— 不做无谓等待。
+    """
+    import gw_discover
+    box = {}
+    done = threading.Event()
+
+    def _run():
+        try:
+            box["r"] = gw_discover.acp_deliver(sid, text, verbose=True)
+        except Exception as e:                    # noqa: BLE001
+            box["r"] = (False, f"{type(e).__name__}: {e}")
+        finally:
+            done.set()
+
+    th = threading.Thread(target=_run, name="acp-send", daemon=True)
+    th.start()
+
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if _verify_landed(sid, text, baseline, wait=0):
+            return True, (box["r"][1] if box.get("r") else "acp/landed")
+        if done.is_set():
+            r = box.get("r") or (False, "acp: no result")
+            return bool(r[0]), r[1]
+        time.sleep(0.4)
+    # ACP 线程还在跑（会话很大、正在加载）：消息往往稍后才落库，
+    # 这时报"已发出、后台处理中"比报失败更接近事实。
+    return False, "acp: sending in background"
+
+
+def _acp_fatal(info):
+    """ACP 的失败是不是"结构性不可达"（重试 reply 也好不了）。
+
+    实测（2026-10-20 11:29，会话 693e07e8）：目标会话属于 2026-10-19 项目，
+    而当时没有任何实例的 cwd 落在那儿 —— ACP 直接拒投（宁可失败也不写错
+    项目目录）。这种失败再刷十轮 reply 也还是全 409，必须立刻收手，否则
+    用户对着工牌干等三十秒。
+    """
+    s = str(info or "")
+    return ("没有打开的窗口" in s or "no cwd" in s
+            or "no gateway credential" in s)
+
+
 def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
                  wait_max=_BUSY_WAIT_MAX, on_status=None):
     """核心投递：等空闲 -> 锁定实例投递 -> 回读验真 -> 没落库就重来。
@@ -2244,136 +2292,123 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
     locked = None                 # (base, pw, why)：已受理本次投递的实例
     last_msg = "unknown"
     verified = False
+    acp_tried = False
 
     while detail["attempts"] < _MAX_ATTEMPTS:
         detail["attempts"] += 1
 
-        # ---- ① 先算候选：它顺带回答了"这会话有没有被某个窗口装载" ----
-        # 顺序很关键。原来是"先探忙闲、再算候选"，而探忙闲本身要跑一遍网关
-        # 发现（实测 1.5~2.3s）。目标根本没装载时，等空闲毫无意义 —— 先把
-        # 候选拿到，没人认领就跳过等待，省掉这段纯空转（用户盯着工牌等）。
-        cands = None
-        if locked is None:
-            cands = []
-            if route and route[0]:
-                cands.append({"base": route[0], "password": route[1],
-                              "why": "pinned",
-                              "port": route[0].rsplit(":", 1)[-1]})
-            try:
-                cands += [c for c in gw_discover.deliver_candidates(
-                    sid, force=detail["attempts"] > 3)
-                    if not any(x["base"] == c["base"] for x in cands)]
-            except Exception as e:                # noqa: BLE001
-                print(f"[SEND] 候选发现异常: {type(e).__name__}: {e}", flush=True)
-            detail["probed"] = len(cands)
-            if not cands:
-                last_msg = "No gateway"
-                if time.time() >= deadline:
-                    break
-                time.sleep(2.0)
-                continue
-
-        # 有没有实例认领这条会话（live/owner 两条键，刚探过，不额外花钱）
-        claimed = [c for c in (cands or [])
-                   if str(c.get("live")) == str(sid)
-                   or str(c.get("owner")) == str(sid)]
-        claimable = locked is not None or bool(claimed)
-        detail["claimed"] = claimable
-
-        # ---- ② 只有装载着的会话才可能"忙"，也只有它值得等 ----
-        if claimable:
-            probe = (locked[0], locked[1]) if locked else route
-            busy, _ = _probe_busy(sid, probe)
-            if busy:
-                detail["busy"] = True
-                if not queued:
-                    queued = True
-                    if on_status:
-                        on_status("Queued")
-                    print(f"[SEND] 目标会话在跑，排队等空闲: {str(sid)[:8]}",
-                          flush=True)
-                if time.time() < deadline:
-                    t0 = time.time()
-                    while time.time() < deadline:
-                        time.sleep(_BUSY_POLL)
-                        still, _ = _probe_busy(sid, probe)
-                        if not still:
-                            break
-                    detail["waited"] += time.time() - t0
+        # ---- ① 候选：所有网关实例（只用来排序，不再用来判"打开没打开"）----
+        cands = []
+        if route and route[0]:
+            cands.append({"base": route[0], "password": route[1],
+                          "why": "pinned",
+                          "port": str(route[0]).rsplit(":", 1)[-1]})
+        try:
+            cands += [c for c in gw_discover.deliver_candidates(
+                sid, force=detail["attempts"] > 1)
+                if not any(x["base"] == c["base"] for x in cands)]
+        except Exception as e:                    # noqa: BLE001
+            print(f"[SEND] 候选发现异常: {type(e).__name__}: {e}", flush=True)
+        detail["probed"] = len(cands)
+        if not cands:
+            last_msg = "No gateway"
+            if time.time() >= deadline:
+                break
+            time.sleep(2.0)
+            continue
 
         baseline = _line_count(_session_jsonl(sid))
 
-        # ---- ③ 投递：没锁定实例就按可信度挨个试，409 换下一个 ----
-        if cands is not None:
-            for c in cands:
-                rc, info = _reply_raw(c["base"], c["password"], sid, text)
-                detail["tries"].append(f"{c.get('port') or c['base'].rsplit(':', 1)[-1]}:{rc}")
-                if rc == 200:
-                    locked = (c["base"], c["password"], c["why"])
-                    print(f"[SEND] 实例受理 -> {c['base']} [{c['why']}]",
-                          flush=True)
-                    break
-                if rc == 401:
-                    last_msg = "auth expired"
-                elif rc in (-1, -2):
-                    last_msg = info
-                elif rc == 409:
-                    last_msg = "Not live on any instance"
-                else:
-                    last_msg = info
-            if locked is None:
-                print(f"[SEND] 第 {detail['attempts']} 轮：所有实例都不受理 "
-                      f"({','.join(detail['tries'][-6:])})", flush=True)
-                # 全实例 409 = 谁都没装载这个会话。头一轮可能是窗口切换的瞬态，
-                # 但再耗下去就是空转 —— 以前 12 轮 × 2s，用户盯着工牌干等半分钟，
-                # 最后只收到一句 "Not live on any instance"。这里判定：没有任何
-                # 实例认领 -> 它根本没在任何窗口里打开，直接认栽，把"去把那个
-                # 对话点开"这个动作交还给用户。
-                if detail["attempts"] >= _DEAD_AFTER_ROUNDS and not claimed:
-                    detail["not_open"] = True
-                    detail["live_now"] = sorted(
-                        {c["live"] for c in cands if c.get("live")})
-                    last_msg = "对话未打开"
-                    print(f"[SEND] 目标会话不在任何窗口里，停止重试 "
-                          f"{str(sid)[:8]}（当前活会话 "
-                          f"{[str(x)[:8] for x in detail['live_now']] or '无'}）",
-                          flush=True)
-                    break
-                if time.time() >= deadline:
-                    break
-                time.sleep(1.0)          # 换窗口/重启网关的瞬态，给它 1 秒
-                continue
-        else:
-            rc, info = _reply_raw(locked[0], locked[1], sid, text)
-            detail["tries"].append(f"{locked[0].rsplit(':', 1)[1]}:{rc}")
-            if rc != 200:
-                locked = None                     # 实例变了/掉线 -> 下一轮重找
+        # ---- ② 盲投：每个实例都试一次 ----
+        # 不再拿 owner/live 预判"这条会话有没有被打开"。2026-10-20 实测：
+        # 用户明明点开了那条对话，窗口空闲时实例会匿名（activeSessionId /
+        # sessions/live 双双为空），于是被判成"对话未打开"—— 这就是用户
+        # 反复看到的那句错话。reply 的 409 是干净的（不会落到任何地方），
+        # 所以盲投零风险，而且它才是唯一可靠的判据。
+        hit = None
+        for c in cands:
+            rc, info = _reply_raw(c["base"], c["password"], sid, text)
+            detail["tries"].append(
+                f"{c.get('port') or str(c['base']).rsplit(':', 1)[-1]}:{rc}")
+            if rc == 200:
+                hit = c
+                locked = (c["base"], c["password"], c["why"])
+                print(f"[SEND] 实例受理 -> {c['base']} [{c['why']}]",
+                      flush=True)
+                break
+            if rc == 401:
+                last_msg = "auth expired"
+            elif rc in (-1, -2):
                 last_msg = info
-                if time.time() >= deadline:
-                    break
-                time.sleep(1.5)
-                continue
+            elif rc == 409:
+                last_msg = "Not live on any instance"
+            else:
+                last_msg = info
 
-        # ---- ④ 回读会话记录验真：只信落库，不信回执 ----
-        if _verify_landed(sid, text, baseline):
-            verified = True
-            detail["via"] = locked[2] if locked else None
-            break
-        last_msg = "delivered 但未落库"
-        print(f"[SEND] 第 {detail['attempts']} 轮：回执成功但未落库 -> 重试",
-              flush=True)
+        # ---- ③ 有实例受理：回读验真 ----
+        if hit:
+            if _verify_landed(sid, text, baseline, wait=8.0):
+                verified = True
+                detail["via"] = hit["why"]
+                break
+            # 200 但没落库 = 那个窗口正在跑 run，这条 follow-reply 被静默
+            # 丢弃（老问题）。此时**不能**改用 ACP —— 会跟正开着的窗口抢
+            # writer。老实等它跑完再投。
+            detail["busy"] = True
+            last_msg = "delivered 但未落库（窗口正忙）"
+            print(f"[SEND] 第 {detail['attempts']} 轮：回执 200 但未落库"
+                  f"（窗口忙），等空闲重投", flush=True)
+            if not queued:
+                queued = True
+                if on_status:
+                    on_status("Queued")
+            if time.time() < deadline:
+                t0 = time.time()
+                while time.time() < deadline:
+                    time.sleep(_BUSY_POLL)
+                    if not _probe_busy(sid, (hit["base"], hit["password"]))[0]:
+                        break
+                detail["waited"] += time.time() - t0
+            continue
+
+        # ---- ④ 全实例 409：没有任何窗口装载这条会话 ----
+        # 这正是用户最常撞的场景（工牌列表里那条对话几分钟前就关了，或者
+        # 开在别的 Space / 别的窗口）。2026-10-20 起改走 ACP 官方协议：
+        # session/resume + session/prompt 直接对该会话发消息，不依赖窗口
+        # 焦点，也不需要用户"先去点开它"。失败才退回"对话未打开"。
+        if not acp_tried:
+            acp_tried = True
+            print(f"[SEND] 第 {detail['attempts']} 轮：全部实例 409 "
+                  f"({','.join(detail['tries'][-6:])}) -> 转 ACP 通道",
+                  flush=True)
+            if on_status:
+                on_status("Sending")
+            ok, info = _acp_try_deliver(sid, text, baseline)
+            detail["acp"] = info
+            if ok:
+                verified = True
+                detail["via"] = info
+                break
+            last_msg = info
+            print(f"[SEND] ACP 通道也没成: {info}", flush=True)
+            if _acp_fatal(info):
+                # 连"按 cwd 找实例"都找不到 → 这条对话所在的项目压根没有窗口
+                # 开着。别刷满 30 秒，立刻如实报"未打开"。
+                detail["not_open"] = True
+                detail["acp_fatal"] = True
+                break
+            # 其它失败（连接抖动、prompt 超时）留一次快速复核，不占满等待窗口
+            deadline = min(deadline, time.time() + 6.0)
         if time.time() >= deadline:
             break
-        time.sleep(2.0)
+        time.sleep(1.0)
 
     if verified:
         return True, "Sent", detail
-    # 只有"装载在某窗口里"的会话才可能忙；没认领就别再花一次网关发现去探忙闲
-    if not detail["busy"] and detail.get("claimed"):
-        try:
-            detail["busy"] = _probe_busy(sid, route)[0]
-        except Exception:                             # noqa: BLE001
-            pass
+    if not detail.get("acp") and not detail.get("acp_fatal"):
+        detail["not_open"] = True
+    if detail.get("not_open"):
+        last_msg = "对话未打开"
     return False, last_msg, detail
 
 
@@ -2447,11 +2482,11 @@ def _deliver(ble: BleCenter, idx: int, text: str):
               f"(attempts {detail['attempts']}, waited {detail['waited']:.0f}s, "
               f"probed {detail['probed']})", flush=True)
     elif detail.get("not_open"):
-        # 不是网络问题、不是忙，是这条对话根本没在任何一个 WorkBuddy 窗口里
-        # 打开 —— 网关的 reply 只认"窗口里装载着的那个会话"，别的必 409。
+        # 两条通道都没成：reply 只认"窗口里装载着的那个会话"（其余 409），
+        # ACP 又要求"该会话所属项目得有窗口开着"。到这儿就是真投不进去了。
         print(f"[SEND] 目标对话未打开: {str(sid)[:8]}（当前活会话 "
-              f"{[str(s)[:8] for s in detail.get('live_now') or []] or '无'}）",
-              flush=True)
+              f"{[str(s)[:8] for s in detail.get('live_now') or []] or '无'}"
+              f"；ACP: {detail.get('acp') or '未尝试'}）", flush=True)
         # 立刻按"能投"重排对话列表：live 的顶到第一条，避免用户再按 OK
         # 又撞同一个死目标。
         invalidate_conversations()

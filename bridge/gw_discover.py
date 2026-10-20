@@ -669,12 +669,15 @@ def _data_of(obj):
 
 
 def session_cwd(sid):
-    """会话的工作目录（cwd）—— 用于把会话钉到实例上。
+    """会话的工作目录（cwd）—— 用于把会话钉到实例上，ACP 的 session/resume
+    更是**必须**带上它（缺了直接 400 Invalid params: cwd 必填）。
 
-    两个独立来源，优先心跳（快、且带 kind 可以排掉 CLI host）：
-      1. ~/.workbuddy/sessions/*.json 里 sessionId 匹配项的 cwd
-      2. 会话 jsonl 第一行的 cwd 字段
-    找不到返回 None。
+    四个独立来源，按可靠性从高到低：
+      1. ~/.workbuddy/sessions/*.json 心跳里的 cwd（快，带 kind 可排掉 CLI host）
+      2. ~/.workbuddy/workbuddy.db 的 sessions.cwd（最准，会话关着也有）
+      3. 会话 jsonl 前几行里的 cwd（首行是 session-meta，通常没有 cwd，
+         真正的 cwd 在第 2~3 行）
+      4. 都没有 -> None
     """
     if not sid:
         return None
@@ -704,7 +707,11 @@ def session_cwd(sid):
         return cwd
     if best:
         return best
-    # 心跳没写 cwd（或文件已清）时退回 jsonl 首行
+    cwd = _cwd_from_db(sid)
+    if cwd:
+        return cwd
+    # 心跳和 DB 都没有时退回 jsonl —— 注意首行是 session-meta（无 cwd），
+    # 真实 cwd 在第一条 message 记录上，所以要前几行一起扫。
     try:
         hits = list(Path("~/.workbuddy/projects").expanduser()
                     .glob(f"*/{sid}.jsonl"))
@@ -713,14 +720,36 @@ def session_cwd(sid):
     for p in hits:
         try:
             with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                first = fh.readline()
-            d = json.loads(first)
-            cwd = d.get("cwd") or (d.get("meta") or {}).get("cwd")
-            if cwd:
-                return str(cwd)
+                for _, line in zip(range(8), fh):
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    cwd = d.get("cwd") or (d.get("meta") or {}).get("cwd")
+                    if cwd:
+                        return str(cwd)
         except Exception:                              # noqa: BLE001
             continue
     return None
+
+
+def _cwd_from_db(sid):
+    """从 workbuddy.db 的 sessions 表读 cwd（只读打开，失败一律 None）。"""
+    import sqlite3
+    home = Path(os.environ.get("WB_HOME") or "~/.workbuddy").expanduser()
+    db = home / "workbuddy.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = con.execute("SELECT cwd FROM sessions WHERE id=?",
+                              (sid,)).fetchone()
+        finally:
+            con.close()
+        return str(row[0]) if row and row[0] else None
+    except Exception:                                  # noqa: BLE001
+        return None
 
 
 def gateway_cwd(port, password, timeout=1.5):
@@ -850,6 +879,204 @@ def is_live(sid, force=False):
     if not sid:
         return False
     return str(sid) in live_sessions(force=force)
+
+
+# ---------------------------------------------------------------------------
+# ACP 通道 —— 唯一**不依赖"哪个窗口装载着这条会话"**的投递方式。
+#
+# 2026-10-20 从 app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs 内嵌的
+# OpenAPI 里挖出来的官方协议：
+#
+#   POST /api/v1/acp/connect              -> {connectionId, sessionToken}
+#   POST /api/v1/acp  (JSON-RPC, SSE 回)  header: acp-connection-id
+#        initialize
+#        session/resume {sessionId, cwd}  加载会话运行态（不回放历史，实测 0.0s）
+#        session/prompt {sessionId, prompt:[{type:"text", text}]}
+#                                         发用户消息，等本轮 Agent 跑完
+#
+# 实机证据（2026-10-20 10:48，会话 01a13d94，窗口**没有**打开它）：
+#   reply 全实例 409 -> ACP session/resume 200 -> session/prompt 200
+#   / end_turn 3.7s -> 会话 jsonl 从 1575B 涨到 4981B，出现 role=user 的
+#   这条消息 + assistant 的回复。也就是说"窗口没开这个对话"不再是死路。
+#
+# 代价：session/prompt 同步等到 end_turn（小会话 3.7s，几十 MB 的大会话
+# 更久），所以调用方要么放后台线程、要么用"回读落库"当判据而不是等它返回。
+# ---------------------------------------------------------------------------
+
+
+class AcpClient:
+    """一个 ACP 连接：connect -> initialize -> resume -> prompt。"""
+
+    def __init__(self, port, password, timeout=15):
+        self.port = int(port)
+        self.pw = password
+        self.cid = None
+        self.timeout = timeout
+
+    # -- 底层 ---------------------------------------------------------
+    def _headers(self, extra=None):
+        h = {"Authorization": f"Bearer {self.pw}",
+             "X-CodeBuddy-Request": "1",
+             "Content-Type": "application/json",
+             # 少这个头 initialize 直接 406：
+             # "Client must accept both application/json and text/event-stream"
+             "Accept": "application/json, text/event-stream"}
+        if extra:
+            h.update(extra)
+        return h
+
+    def connect(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/v1/acp/connect",
+            data=b"{}", method="POST", headers=self._headers())
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+        self.cid = (body or {}).get("connectionId")
+        if not self.cid:
+            raise RuntimeError(f"no connectionId: {str(body)[:80]}")
+        return self.cid
+
+    def rpc(self, rid, method, params, timeout=90):
+        """发一条 JSON-RPC，从 SSE 流里挑出 id 相同的 result/error。"""
+        payload = {"jsonrpc": "2.0", "id": rid,
+                   "method": method, "params": params}
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/v1/acp",
+            data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers=self._headers({"acp-connection-id": self.cid}))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                for raw in r:                     # 逐行读，别整包 read
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        obj = json.loads(line[6:])
+                    except ValueError:
+                        continue
+                    if obj.get("id") != rid:
+                        continue                  # 期间的通知/流式块
+                    if "error" in obj:
+                        return False, obj["error"]
+                    return True, obj.get("result")
+        except urllib.error.HTTPError as he:
+            return False, {"http": he.code,
+                           "body": he.read().decode("utf-8", "replace")[:200]}
+        except Exception as e:                    # noqa: BLE001
+            return False, {"error": f"{type(e).__name__}: {e}"}
+        return False, {"error": "no result in stream"}
+
+    # -- 语义 ---------------------------------------------------------
+    def open_session(self, sid, cwd):
+        ok, err = self.rpc(1, "initialize", {
+            "protocolVersion": 1,
+            "clientInfo": {"name": "wb-bridge", "version": "1.0"},
+            "clientCapabilities": {"fs": {"readTextFile": False,
+                                          "writeTextFile": False},
+                                   "terminal": False}})
+        if not ok:
+            return False, f"initialize: {str(err)[:120]}"
+        ok, err = self.rpc(2, "session/resume",
+                           {"sessionId": sid, "cwd": cwd}, timeout=90)
+        if not ok:
+            # 老版本网关可能只认 session/load（会回放历史，慢但能用）
+            ok, err = self.rpc(4, "session/load",
+                               {"sessionId": sid, "cwd": cwd}, timeout=180)
+            if not ok:
+                return False, f"resume: {str(err)[:140]}"
+        return True, "resumed"
+
+    def prompt(self, sid, text, timeout=120):
+        return self.rpc(3, "session/prompt",
+                        {"sessionId": sid,
+                         "prompt": [{"type": "text", "text": text}]},
+                        timeout=timeout)
+
+
+_ACP_CACHE = {"at": 0.0, "port": None}          # 上次跑通的端口，省一次探测
+
+
+def _acp_pick_ports(prefer=None):
+    """候选实例端口（真正能不能用由 acp_deliver 按 cwd 过滤）。"""
+    ports = []
+    if prefer:
+        ports.append(int(prefer))
+    try:
+        for p in find_gateway_ports(password=find_gateway()["password"]):
+            if p not in ports:
+                ports.append(p)
+    except Exception:                                 # noqa: BLE001
+        pass
+    cached = _ACP_CACHE.get("port")
+    if cached and cached in ports:
+        ports.remove(cached)
+        ports.insert(0, cached)
+    return ports
+
+
+def acp_deliver(sid, text, cwd=None, prefer_port=None, password=None,
+                prompt_timeout=120, verbose=False):
+    """用 ACP 把一句话发进会话 —— **不需要窗口焦点**。
+
+    返回 (ok, info)。ok=True 只说明 Agent 本轮跑完（result.stopReason），
+    是否真落库仍建议调用方回读 jsonl 复核。
+
+    ⚠️ 必须选 **cwd 与目标会话相同**的实例（2026-10-20 实测踩坑）：
+    ACP 的 session/resume 虽然要求传 cwd，但真正决定"会话文件写到哪个
+    projects/<slug>/ 下"的是**网关实例自己的 cwd**。传给 53584
+    （cwd=2026-10-09 项目）去发一个属于 2026-10-19 项目的会话，它会在
+    2026-10-09 目录下新建一个同名 sid 的 jsonl —— 消息确实进去了，但进的
+    是"另一个项目里的同名会话"，用户在原来那个对话里一个字都看不到。
+    所以宁可失败，也不能投错地方。
+    """
+    if not sid or not (text or "").strip():
+        return False, "empty"
+    cwd = cwd or session_cwd(sid)
+    if not cwd:
+        return False, "no cwd (无法定位会话所属项目)"
+    pw = password or (find_gateway() or {}).get("password")
+    if not pw:
+        return False, "no gateway credential"
+
+    matched, seen = [], []
+    for port in _acp_pick_ports(prefer_port):
+        try:
+            inst_cwd = gateway_cwd(port, pw)
+        except Exception:                             # noqa: BLE001
+            continue
+        seen.append(f"{port}={inst_cwd.rsplit('/', 1)[-1] or '?'}")
+        if inst_cwd == cwd:
+            matched.append(port)
+        elif verbose:
+            print(f"[ACP] skip {port}: 实例 cwd={inst_cwd} != 会话 {cwd}",
+                  flush=True)
+    if not matched:
+        return False, f"该项目没有打开的窗口({','.join(seen[:3]) or '无实例'})"
+
+    last = "no gateway port"
+    for port in matched:
+        try:
+            client = AcpClient(port, pw)
+            client.connect()
+        except Exception as e:                        # noqa: BLE001
+            last = f"{port}: connect {type(e).__name__}"
+            continue
+        ok, info = client.open_session(sid, cwd)
+        if not ok:
+            last = f"{port}: {info}"
+            if verbose:
+                print(f"[ACP] {last}", flush=True)
+            continue
+        _ACP_CACHE.update(at=time.monotonic(), port=port)
+        ok, res = client.prompt(sid, text, timeout=prompt_timeout)
+        if not ok:
+            return False, f"prompt: {str(res)[:140]}"
+        stop = (res or {}).get("stopReason")
+        if verbose:
+            print(f"[ACP] port={port} stop={stop} msgId="
+                  f"{str((res or {}).get('userMessageId'))[:8]}", flush=True)
+        return True, f"acp/{port}/{stop or 'ok'}"
+    return False, last
 
 
 if __name__ == "__main__":

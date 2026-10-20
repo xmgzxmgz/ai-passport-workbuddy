@@ -671,10 +671,10 @@ async function sendDraft() {
       state.msgSig = '';
       loadMessages();
     } else if (r.message === '对话未打开') {
-      // 网关的 reply 只服务"窗口里装载着的那个会话"，其余一律 409。
-      // 这不是网络问题，重试没用 —— 直接告诉用户该做什么。
-      toast('投递失败：这个对话没在任何窗口打开。先在 WorkBuddy 里点开它，'
-            + '或改投带 live 的对话', 'err');
+      // reply 只服务"窗口里装载着的那个会话"，ACP 又要求该会话所属项目
+      // 有窗口开着。两条路都没成才报这句 —— 重试无用，说清该做什么。
+      toast('投递失败：这个对话所属的项目没有窗口打开。在 WorkBuddy 里打开'
+            + '一次那个项目再发（对话本身不用点开）', 'err');
     } else {
       toast('投递失败：' + (r.message || '未知'), 'err');
     }
