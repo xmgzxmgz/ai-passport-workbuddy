@@ -32,6 +32,7 @@ const state = {
   playing: null,
   logLines: [],
   logCount: 0,
+  logSig: null,
   config: null,
   tick: 0,
   targetConv: '',
@@ -399,29 +400,56 @@ function togglePlay(name) {
 
 /* ------------------------------ 日志 ------------------------------ */
 
+/* 日志行真实格式是 `[09:53:35] BLE <uuid> mtu=247 pushed=51 recv=0`，
+   不是 `[BLE] ...` —— 早期按方括号写的过滤规则一条都命中不了，满屏心跳。
+   这里改成「先抽 tag，再按 tag 判断」。 */
+function logTag(l) {
+  const m = /^(?:\[[0-9:.]+\]\s*)?(\[[A-Za-z]+\]|[A-Za-z]+)/.exec(l);
+  return m ? m[1].replace(/[[\]]/g, '').toUpperCase() : '';
+}
+
+/* 纯心跳噪声：工牌每来一帧写一行、网关每 2 秒写一行 */
+const LOG_NOISE = [
+  /^\[[0-9:.]+\]\s*BLE\s+\S+\s+mtu=\d+\s+PUSHED=\d+\s+RECV=0\s*$/i,
+  /^\[[0-9:.]+\]\s*IDLE\s+task=-\s*$/,
+];
+
+/* 连续重复只留一条，末尾标 ×N —— BUSY task=xxx 每 2 秒一行，翻十屏都是它 */
+function collapseDup(lines) {
+  const res = [];
+  for (const l of lines) {
+    const body = l.replace(/^\[[0-9:.]+\]\s*/, '');
+    const last = res[res.length - 1];
+    if (last && last.body === body) { last.n++; last.line = l; continue; }
+    res.push({ body, line: l, n: 1 });
+  }
+  return res.map((x) => (x.n > 1 ? `${x.line}   ↻ ×${x.n}` : x.line));
+}
+
 async function loadLogs() {
-  const r = await jget('/logs?tail=400', 6000).catch(() => null);
+  const quiet = $('#logQuiet') && $('#logQuiet').checked;
+  // 静音模式下先多取一些再过滤，否则有用行会被 400 行心跳挤出窗口
+  const tail = quiet ? 1500 : 400;
+  const r = await jget('/logs?tail=' + tail, 8000).catch(() => null);
   if (!r) return;
-  if (r.lines.length === state.logCount && state.logSig === r.lines.length) return;
+  const sig = tail + ':' + r.lines.length;
+  if (sig === state.logSig) return;
+  state.logSig = sig;
   state.logCount = r.lines.length;
   const filter = ($('#logFilter').value || '').trim().toLowerCase();
-  const quiet = $('#logQuiet') && $('#logQuiet').checked;
   let lines = r.lines;
-  if (quiet) {
-    // 工牌每到一帧就写一行 [BLE] ... pushed=N recv=0，全是心跳噪声；
-    // 出问题时真正有用的是连接变化、[SEND]、[ASR]、Traceback。
-    lines = lines.filter((l) => !/\[BLE\] .*pushed=\d+ recv=\d+$/.test(l) ||
-                              /mtu=\d+ pushed=1\b/.test(l));
-  }
+  if (quiet) lines = lines.filter((l) => !LOG_NOISE.some((re) => re.test(l)));
   if (filter) lines = lines.filter((l) => l.toLowerCase().includes(filter));
+  if (quiet) lines = collapseDup(lines);
   const cls = (l) => {
-    if (/Traceback|错误|失败|ERROR/.test(l)) return 'l-err';
-    if (l.includes('[SEND]')) return 'l-send';
-    if (l.includes('[BLE]')) return 'l-ble';
-    if (l.includes('[ASR]')) return 'l-asr';
-    if (l.includes('[GW]')) return 'l-gw';
+    if (/Traceback|错误|失败|ERROR|Exception/.test(l)) return 'l-err';
     if (l.startsWith('===')) return 'l-sep';
-    if (l.includes('[app]') || l.includes('[menubar]')) return 'l-app';
+    const t = logTag(l);
+    if (t === 'SEND') return 'l-send';
+    if (t === 'BLE') return 'l-ble';
+    if (t === 'ASR') return 'l-asr';
+    if (t === 'GW') return 'l-gw';
+    if (t === 'APP' || t === 'MENUBAR') return 'l-app';
     return '';
   };
   const view = $('#logView');
@@ -467,7 +495,7 @@ function go(page) {
     dashboard: ['总览', '工牌语音 → 本地转写 → 投进 WorkBuddy 对话框'],
     conversations: ['对话', '点左边任意对话查看消息；底部可直发一句测试投递'],
     voice: ['语音', '试听、重新转写、把录音重新投进任意对话'],
-    logs: ['日志', '~/.workbuddy/wb_bridge.log 最近 400 行'],
+    logs: ['日志', '~/.workbuddy/wb_bridge.log 最近 400 行（只看重要时取 1500 行再滤）'],
     settings: ['设置', '识别模型与运行环境'],
   };
   $('#pageTitle').textContent = titles[page][0];
@@ -564,8 +592,10 @@ function bind() {
   $('#btnVoiceDir2').addEventListener('click', () => openDir());
 
   // 日志
-  $('#logFilter').addEventListener('input', () => { state.logCount = -1; loadLogs(); });
-  $('#logQuiet').addEventListener('change', () => { state.logCount = -1; loadLogs(); });
+  // 日志：改过滤词 / 切静音都要强制重渲染（sig 只认 tail+行数，会挡住）
+  const reloadLogs = () => { state.logSig = null; loadLogs(); };
+  $('#logFilter').addEventListener('input', reloadLogs);
+  $('#logQuiet').addEventListener('change', reloadLogs);
   $('#btnOpenLog').addEventListener('click', () => openLog());
 
   // 设置

@@ -69,6 +69,14 @@ chmod +x "$APP/Contents/MacOS/WBBridge"
 mkdir -p "$APP/Contents/Resources/web"
 rsync -a --exclude '.DS_Store' packaging/web/ "$APP/Contents/Resources/web/"
 
+# 固件字库白名单（下发前 clean() 用它剔除固件渲染不出的字符，20KB 值得带上）
+if [[ -f firmware/fonts/symbols.txt ]]; then
+  mkdir -p "$APP/Contents/Resources/fonts"
+  cp firmware/fonts/symbols.txt "$APP/Contents/Resources/fonts/symbols.txt"
+else
+  echo "  ! 缺 firmware/fonts/symbols.txt，字库校验会降级"
+fi
+
 [[ -f "$ICON" ]] && cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 cp packaging/安装与使用.txt "$APP/Contents/Resources/安装与使用.txt"
 

@@ -183,17 +183,29 @@ REQ_ALL, REQ_LIST, REQ_MSG, REQ_USAGE = 0, 1, 2, 3
 # 工具
 # ===========================================================================
 
-# 固件字库白名单（由 ai-passport/fonts/gen_font.js 与 symbols.txt 同源）
+# 固件字库白名单（由 firmware/fonts/gen_font.js 与 symbols.txt 同源）
 # 不在这个集合里的字符固件渲染不出来（会变豆腐块），下发前必须替换掉。
-FONT_SYMBOLS = BRIDGE_DIR.parent / "ai-passport" / "fonts" / "symbols.txt"
+# 仓库里在 firmware/fonts/，打包进 app 后在 Resources/fonts/ —— 两处都试。
+_FONT_SYMBOLS_CANDIDATES = tuple(
+    p for p in (
+        Path(os.environ["WB_FONT_SYMBOLS"]).expanduser()
+        if os.environ.get("WB_FONT_SYMBOLS") else None,
+        BRIDGE_DIR.parent / "firmware" / "fonts" / "symbols.txt",   # 源码树
+        BRIDGE_DIR.parent / "fonts" / "symbols.txt",                # app bundle
+        BRIDGE_DIR.parent / "ai-passport" / "fonts" / "symbols.txt",  # 旧布局
+    ) if p is not None
+)
 
 
 def _load_font_chars():
-    try:
-        return set(FONT_SYMBOLS.read_text(encoding="utf-8"))
-    except OSError as e:
-        print(f"[warn] 字库白名单读取失败({e})，降级为范围判断")
-        return None
+    for path in _FONT_SYMBOLS_CANDIDATES:
+        try:
+            return set(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    tried = "、".join(str(p) for p in _FONT_SYMBOLS_CANDIDATES)
+    print(f"[warn] 字库白名单没找到（找过 {tried}），降级为范围判断")
+    return None
 
 
 _FONT_CHARS = _load_font_chars()
