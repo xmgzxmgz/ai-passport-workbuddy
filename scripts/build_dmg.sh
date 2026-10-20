@@ -58,12 +58,16 @@ rsync -a \
 cp "$PLIST" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# 菜单栏壳：Swift 编译。没有它就只能当纯后台进程 —— 双击没反应，用户以为
-# 打不开（这正是第一版 shell 启动器踩的坑）。
-echo "▸ 编译菜单栏应用"
-swiftc -O -swift-version 5 -framework AppKit \
+# 菜单栏壳 + 主窗口（WKWebView 承载本地控制台）。Swift 编译，无 Xcode 也能跑：
+# 只用 AppKit / WebKit，不碰 SwiftUI 宏。
+echo "▸ 编译桌面壳"
+swiftc -O -swift-version 5 -framework AppKit -framework WebKit \
   packaging/menubar/main.swift -o "$APP/Contents/MacOS/WBBridge"
 chmod +x "$APP/Contents/MacOS/WBBridge"
+
+# 本地 Web 控制台（服务端 GET /ui 直接读这里）
+mkdir -p "$APP/Contents/Resources/web"
+rsync -a --exclude '.DS_Store' packaging/web/ "$APP/Contents/Resources/web/"
 
 [[ -f "$ICON" ]] && cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 cp packaging/安装与使用.txt "$APP/Contents/Resources/安装与使用.txt"

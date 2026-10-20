@@ -65,10 +65,51 @@
         │   ASR   faster-whisper（本地，支持 CUDA）            │
         │                                                     │
         │   发送  WorkBuddy 本地网关 REST API                  │
+        │                                                     │
+        │   HTTP  127.0.0.1:<port>  /ui /status /voice /logs … │
+        └───────────────────┬─────────────────────────────────┘
+                            │
+        ┌───────────────────┴─────────────────────────────────┐
+        │   WBBridge.app（AppKit 壳 + WKWebView）              │
+        │   菜单栏图标 · 主窗口控制台 · 拉起/停止 python 子进程 │
         └─────────────────────────────────────────────────────┘
 ```
 
 数据流是**单向只读**的：中转服务只读 WorkBuddy 的数据文件，不写、不改。唯一会落笔的地方是「发送」这一步，走的是 WorkBuddy 自己的本地网关。
+
+---
+
+## 桌面应用（控制台）
+
+装好 `WBBridge.app` 双击就有界面，不用开终端。它同时给你三样东西：
+
+**1. 主窗口** —— 服务自带的本地控制台（`GET /ui`），五个页面：
+
+| 页面 | 内容 |
+|---|---|
+| 总览 | 服务状态（PID/端口/模型）、工牌 BLE（设备/MTU/帧数）、WorkBuddy 当前任务与额度；最近对话、最近录音、快捷操作 |
+| 对话 | 左边会话列表（搜索、状态色标），右边完整消息流（**看全文，不是工牌那种 120 字截断**），底部可直接发一句话测试投递 |
+| 语音 | 录音列表 + 试听（`<audio>`）+ **重新转写** + 改完文本后**重新投递**到任意对话 |
+| 日志 | 日志尾部实时刷新，可按关键字过滤、一键隐藏 BLE 心跳噪声 |
+| 设置 | 换 ASR 模型/语言（热切换，下次转写生效）、查看路径与环境 |
+
+![控制台](docs/app-dashboard.png)
+
+**2. 菜单栏图标** —— 关掉窗口也一直在：
+
+| 图标 | 含义 |
+|---|---|
+| ⊙ 实心 | 服务在跑，工牌已连 |
+| ◯ 空心 | 服务在跑，等工牌 |
+| ⊘ 划掉 | 服务停了 |
+
+点开是状态 + 启停入口（打开控制台 / 启动 / 停止 / 重启 / 打开日志 / 退出）。
+
+**3. 浏览器也能开** —— 控制台就是普通网页，`open http://127.0.0.1:8765/ui` 一样用
+（端口被占时看 `~/.workbuddy/http.port`）。
+
+窗口里的网页通过 `window.webkit.messageHandlers.wb` 调原生能力（打开日志/目录、重启服务），
+在浏览器里这些按钮会退化成提示 —— 因为网页自己没法控制宿主进程。
 
 ---
 
@@ -118,7 +159,7 @@ idf.py -p COM18 flash monitor
 
 ### 2. PC 中转服务
 
-**推荐：装成 app，双击就跑**
+**推荐：装成 app，双击就有界面**
 
 ```bash
 ./scripts/build_dmg.sh          # 产出 dist/WBBridge-1.0.0.dmg
@@ -126,7 +167,8 @@ open dist/WBBridge-1.0.0.dmg    # 挂载后把 WBBridge.app 拖进「应用程�
 ```
 
 app 里已经带了 `bridge/` 全部代码（自包含），双击即启动，第一次会请求蓝牙权限。
-它没有 Dock 图标（后台服务），再双击一次会弹窗告诉你 PID，并可一键停止/重启。
+打开后是一个深色控制台（总览 / 对话 / 语音 / 日志 / 设置），菜单栏同时常驻一个波形图标，
+关掉窗口也不影响服务。
 
 配套的命令行开关 `wbctl`（DMG 里也有，复制到 `~/.local/bin` 即可全局用）：
 
@@ -180,31 +222,39 @@ python wb_bridge.py
 ### 4. 打包成 DMG（实现细节）
 
 ```bash
-./scripts/build_dmg.sh            # 出 dist/WBBridge-1.0.0.dmg（当前 ~376KB）
+./scripts/build_dmg.sh            # 出 dist/WBBridge-1.1.0.dmg（当前 ~400KB）
 ./scripts/build_dmg.sh --no-icon  # 跳过图标重绘
 ```
 
 `scripts/build_dmg.sh` 做的事：
 
-1. `bridge/*.py` 用 `rsync` 塞进 `WBBridge.app/Contents/Resources/bridge/`（排除 `voice_out/`、`.gw_cache.json`、`__pycache__`）；
-2. `swiftc -O` 编译 `packaging/menubar/main.swift` → `Contents/MacOS/WBBridge`（菜单栏壳，见下）；
-3. 拷 `packaging/Info.plist` —— 里面两条 `NSBluetooth*UsageDescription` 是**硬需求**，缺了 python 一碰 CoreBluetooth 就被 SIGKILL（exit 137）；
-4. `codesign --force --deep --sign -` 做 ad-hoc 签名（内容一变必须重签，否则 TCC 把蓝牙授权判成另一个应用）；
-5. `hdiutil create -format UDZO` 出盘，自动挂载自检内容。
+1. `bridge/*.py` 用 `rsync` 塞进 `Contents/Resources/bridge/`（排除 `voice_out/`、`.gw_cache.json`、`__pycache__`）；
+2. `packaging/web/`（控制台前端）→ `Contents/Resources/web/`，由服务的 `GET /ui` 直接吐；
+3. `swiftc -O -framework AppKit -framework WebKit` 编译 `packaging/menubar/main.swift` → `Contents/MacOS/WBBridge`；
+4. 拷 `packaging/Info.plist` —— 里面两条 `NSBluetooth*UsageDescription` 是**硬需求**，缺了 python 一碰 CoreBluetooth 就被 SIGKILL（exit 137）；
+5. `codesign --force --deep --sign -` 做 ad-hoc 签名（内容一变必须重签，否则 TCC 把蓝牙授权判成另一个应用）；
+6. `hdiutil create -format UDZO` 出盘，自动挂载自检内容。
 
-**菜单栏壳**（`packaging/menubar/main.swift`，~450 行 Swift/AppKit）：
+**为什么界面是 Web 而不是原生控件**：这台机器只装了 Command Line Tools、没有 Xcode，
+SwiftUI 的 `@State` / `@EnvironmentObject` 是宏，编译需要 `libSwiftUIMacros.dylib`（只有 Xcode 带），
+`swiftc` 直接报 `plugin for module 'SwiftUIMacros' not found`。要么装 10GB Xcode，
+要么纯 AppKit 手写全部控件 —— 两者都不划算。所以界面交给本地 Web（好写、好改、浏览器里也能开），
+原生只留一层薄壳干三件事：**窗口 / 菜单栏 / 进程管理**。
+
+**桌面壳**（`packaging/menubar/main.swift`，~560 行 Swift/AppKit + WebKit）：
 
 | 行为 | 为什么 |
 |---|---|
-| `NSStatusItem` 常驻图标：实心=工牌已连 / 空心=等工牌 / 划掉=服务停了 | 第一版是纯后台 shell 脚本进程，双击毫无反应 —— 用户视角就是"打不开" |
-| 点开是状态面板：服务 pid 与归属（本应用拉起 / 外部进程）、工牌 peer 与 MTU、对话条数 | 排障时不用开终端 |
-| 菜单项：重启 / 停止 / 启动 / 打开诊断页 / 打开日志 / 退出 | 一个入口管所有事，退出时顺带停掉子进程 |
-| 自己 `Process` 拉起 `wb_bridge.py`，但先探测 8765 是否已被占用 | 若终端里已有实例，进入"接管"模式：只监控、不重复启动 |
-| 按 bundle 相对路径解析代码目录 | 源码目录 / `/Applications` / DMG 挂载点三种位置都能跑 |
-| 解释器探测链 `WB_PYTHON` → bundle 内 venv → 托管 venv → Homebrew → 系统，逐个验 `import bleak, numpy` | 不打包 Python 运行时（带 faster-whisper 好几百 MB），缺依赖时弹窗给安装命令 |
-| `WB_VOICE_DIR` / `WB_GW_CACHE` 重定向到 `~/.workbuddy` | DMG 挂载点只读，代码目录旁边写不了文件 |
+| 主窗口放 `WKWebView`，加载 `http://127.0.0.1:<port>/ui?app=1` | 界面归前端，壳只负责呈现；`app=1` 让页面留出标题栏高度并加可拖拽条 |
+| 关窗口只是 `orderOut`，进程继续跑 | 它是常驻服务，不该因为关了窗就停 |
+| `NSStatusItem` 三态图标 + 状态菜单（pid / 工牌 MTU / 当前任务 / 启停 / 日志） | 平时只要状态就瞄一眼菜单栏 |
+| 自己 `Process` 拉起 `wb_bridge.py`，退出时转发 SIGTERM | 用户不用开终端；TCC 的蓝牙授权也记在 app 上 |
+| 端口从 `~/.workbuddy/http.port` 读 | 8765 被别的程序占了，服务会自动挪端口，壳得知道真实值 |
+| `WKScriptMessageHandler` 提供 `openLog` / `openVoice` / `restart` / `stop` | 网页够不着文件系统和进程，这几个动作走原生 |
+| 服务没起来时显示一张占位页（带「启动服务 / 打开日志 / 重试」） | 比白屏好，也不至于让人以为程序挂了 |
+| 解释器探测链 `WB_PYTHON` → bundle venv → 托管 venv → Homebrew → 系统，逐个验 `import bleak, numpy` | 不打包 Python 运行时（faster-whisper 好几百 MB），缺依赖时弹窗给安装命令 |
 
-`packaging/launcher/wb-bridge` 是同一套逻辑的纯 shell 版（无菜单栏），留着给"不想要 GUI"的场景用。
+`packaging/launcher/wb-bridge` 是最早那版纯 shell 启动器，无窗口无菜单栏，留着给"完全不要 GUI"的场景。
 
 ---
 
@@ -259,10 +309,12 @@ python wb_bridge.py
 
 ## HTTP 调试端点
 
-中转服务在 `127.0.0.1:8765` 上开了一组只读端点，方便不开设备也能查状态：
+中转服务在本机开了一组 HTTP 端点（默认 `127.0.0.1:8765`；**被占用会自动往后挪一个，
+真实端口写在 `~/.workbuddy/http.port`**），桌面壳和浏览器都靠它：
 
 | 端点 | 用途 |
 |---|---|
+| `/ui` | **本地控制台**（本仓库的完整界面：总览 / 对话 / 语音 / 日志 / 设置） |
 | `/health` | 服务健康 + ASR 模型状态 |
 | `/ble` | 设备连接状态（`connected` / `mtu` / `pushed` / `received` / `voice_bytes`） |
 | `/gw` | WorkBuddy 网关状态（端口 / 缓存） |
@@ -274,6 +326,13 @@ python wb_bridge.py
 | `/route?sid=<会话id>` | **投递路由诊断**：这个会话会被投到哪个实例、凭什么这么判 |
 | `/sim?text=&idx=` | **走工牌同一条链路**投递（含等空闲/重试/回执），用于不开麦克风验收 |
 | `/push` | 手动全量下发一次 |
+| `/voice` | 录音列表（文件名 / 时长 / 大小 / 时间） |
+| `/voice/wav?file=` | 播放某条录音（`<audio>` 用） |
+| `/asr?file=` | 对已有录音**重新转写**（不投递） |
+| `/redeliver?file=&conv=&text=&wait=` | 把录音重新投进指定对话（走完整投递链路） |
+| `/logs?tail=300` | 日志尾部 N 行（控制台日志页用） |
+| `/config` | 读配置：模型 / 语言 / 端口 / 目录 / 环境 |
+| `POST /config` | 改模型或语言（`{"model":"medium","lang":"zh"}`），下次转写生效 |
 
 ---
 
@@ -405,7 +464,8 @@ ai-passport-workbuddy/
 │   ├── scan.py / serial_listen.py
 │   └── requirements.txt
 ├── packaging/                   .app / DMG 打包素材
-│   ├── menubar/main.swift       ★ 菜单栏壳（状态图标 / 状态面板 / 启停 / 打开日志）
+│   ├── menubar/main.swift       ★ 桌面壳（主窗口 WKWebView / 菜单栏 / 进程管理 / 原生桥）
+│   ├── web/                     ★ 控制台前端（index.html + style.css + app.js，零依赖）
 │   ├── launcher/wb-bridge       无 GUI 的 shell 启动器（备选）
 │   ├── Info.plist               bundle 描述（含蓝牙用途说明，TCC 必需）
 │   ├── wbctl                    命令行开关（start/stop/status/log/send/route）

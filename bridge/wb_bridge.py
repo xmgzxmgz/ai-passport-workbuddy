@@ -77,6 +77,10 @@ VOICE_DIR    = Path(os.environ.get("WB_VOICE_DIR")
                     or (BRIDGE_DIR / "voice_out")).expanduser()
 
 HTTP_PORT     = int(os.environ.get("WB_HTTP_PORT") or 8765)
+# 实际监听端口写在这里：8765 被别的程序占了会自动往后挪（见 run_http），
+# 桌面壳/wbctl 读这个文件拿真实端口，不用猜。
+PORT_FILE     = WB_HOME / "http.port"
+_started_at   = time.time()          # 服务启动时刻（/status 里用来算运行时长）
 POLL_INTERVAL = 2
 
 OFFLINE_AFTER_MS = 60_000
@@ -510,8 +514,9 @@ def _extract_text(content):
     return "\n".join(parts).strip()
 
 
-def read_messages(session_id, page=0, page_size=MSG_PAGE_MAX):
-    """page 0 = 最新一页"""
+def read_messages(session_id, page=0, page_size=MSG_PAGE_MAX,
+                  text_limit=MSG_BODY_MAX):
+    """page 0 = 最新一页。text_limit 是单条正文截断长度（GUI 传大值看全文）。"""
     path = _find_jsonl(session_id)
     empty = {"total": 0, "page": page, "page_size": page_size,
              "messages": [], "has_more": False}
@@ -537,7 +542,7 @@ def read_messages(session_id, page=0, page_size=MSG_PAGE_MAX):
                 text = _extract_text(o.get("content"))
                 if not text:
                     continue
-                msgs.append({"role": role, "text": text[:MSG_BODY_MAX],
+                msgs.append({"role": role, "text": text[:text_limit],
                              "ts": o.get("timestamp", 0)})
     except OSError:
         return empty
@@ -593,6 +598,9 @@ def compute_state():
         "online": True,
         "percent": usage.get("percent", 0),
         "conv_id": running["id"] if running else None,
+        "pid": os.getpid(),
+        "port": HTTP_PORT,
+        "uptime_service_s": int(time.time() - _started_at),
     }
 
 
@@ -697,6 +705,37 @@ def diag_audio(pcm: bytes, rate: int, tag=""):
               + " ".join(str(int(v)) for v in brms[:8]), flush=True)
 
 
+def wav_duration(path: Path) -> float:
+    """WAV 时长（秒）。只读头，不解码 —— 给 GUI 列表用。"""
+    try:
+        with wave.open(str(path), "rb") as w:
+            rate = w.getframerate() or 1
+            return w.getnframes() / rate
+    except (OSError, EOFError, wave.Error):
+        return 0.0
+
+
+def safe_voice_file(name):
+    """把 GUI 传来的文件名解析成 VOICE_DIR 下的真实路径。
+
+    只接受纯文件名，任何带路径分隔符或 `..` 的输入一律拒绝 —— 这些参数
+    来自 HTTP，不做校验就是任意文件读取。返回 Path 或 None。
+    """
+    if not name:
+        return None
+    name = str(name).strip()
+    if "/" in name or "\\" in name or name in (".", ".."):
+        return None
+    p = (VOICE_DIR / name).resolve()
+    try:
+        root = VOICE_DIR.resolve()
+    except OSError:
+        return None
+    if root not in p.parents:
+        return None
+    return p if p.is_file() else None
+
+
 def load_wav_16k(path: Path):
     """读 WAV -> 16kHz 单声道 float32。
 
@@ -724,6 +763,14 @@ def load_wav_16k(path: Path):
         a = np.interp(np.arange(n) * (rate / 16000.0),
                       np.arange(len(a)), a).astype(np.float32)
     return a
+
+
+def _asr_installed() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def _hf_cached(name: str) -> bool:
@@ -1192,6 +1239,59 @@ def send_to_workbuddy_cli(session_id, text, timeout=90):
 # HTTP 调试端点
 # ===========================================================================
 
+# ---- 前端（本地 Web 控制台）静态资源 -------------------------------------
+
+def web_dir():
+    """找 web/ 目录：打包后在 Resources/web，源码目录在 packaging/web。"""
+    env = os.environ.get("WB_WEB_DIR")
+    cands = []
+    if env:
+        cands.append(Path(env))
+    cands += [
+        BRIDGE_DIR.parent / "web",                  # bundle: Resources/web
+        BRIDGE_DIR.parent / "packaging" / "web",    # 源码目录
+        BRIDGE_DIR / "web",
+    ]
+    for c in cands:
+        try:
+            if (c / "index.html").is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+WEB_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+
+def ui_asset(name):
+    """把 URL 里的文件名解析成 web 目录内的真实文件。
+
+    只接受平铺文件名 + 白名单后缀 —— 这个入口是 HTTP 可达的，
+    不做这些限制就是任意文件读取。
+    """
+    root = web_dir()
+    if not root or not name:
+        return None
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    if Path(name).suffix.lower() not in WEB_MIME:
+        return None
+    p = (root / name).resolve()
+    if root.resolve() not in p.parents or not p.is_file():
+        return None
+    return p
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1202,6 +1302,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_bytes(self, data, ctype, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -1226,7 +1334,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 sid = qs("id")
                 if not sid:
                     return self._send({"error": "missing id"}, 400)
-                self._send(read_messages(sid, int(qs("page", 0))))
+                # GUI 看全文（默认 120 字是给工牌屏幕的），所以两个都能调：
+                #   size = 每页条数，len = 单条正文上限
+                self._send(read_messages(
+                    sid, int(qs("page", 0)),
+                    page_size=max(1, min(200, int(qs("size", MSG_PAGE_MAX)))),
+                    text_limit=max(1, int(qs("len", MSG_BODY_MAX)))))
 
             elif p == "/usage":
                 self._send(get_usage(qs("id")))
@@ -1276,9 +1389,63 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 })
 
             elif p == "/voice":
-                files = sorted(VOICE_DIR.glob("*.wav"))[-8:] if VOICE_DIR.exists() else []
+                items = []
+                if VOICE_DIR.exists():
+                    files = sorted(VOICE_DIR.glob("*.wav"),
+                                   key=lambda f: f.stat().st_mtime)[-80:]
+                    for f in files:
+                        try:
+                            st = f.stat()
+                        except OSError:
+                            continue
+                        items.append({"name": f.name,
+                                      "size": st.st_size,
+                                      "ts": int(st.st_mtime * 1000),
+                                      "duration": round(wav_duration(f), 2)})
                 self._send({"dir": str(VOICE_DIR),
-                            "files": [f.name for f in files]})
+                            "files": [i["name"] for i in items][-8:],
+                            "items": items})
+
+            elif p == "/asr":
+                # 给 GUI 用：对已有录音重新转写（不投递）
+                path = safe_voice_file(qs("file"))
+                if not path:
+                    return self._send({"ok": False, "error": "bad file"}, 400)
+                t0 = time.time()
+                text, err = transcribe(path)
+                self._send({"ok": text is not None, "file": path.name,
+                            "text": text or "", "error": err,
+                            "ms": int((time.time() - t0) * 1000)})
+
+            elif p == "/redeliver":
+                # 给 GUI 用：把某条录音（可带已转写文本）重新投进指定对话
+                text = (qs("text") or "").strip()
+                path = safe_voice_file(qs("file"))
+                if not text:
+                    if not path:
+                        return self._send({"ok": False,
+                                           "error": "need file or text"}, 400)
+                    t0 = time.time()
+                    text, err = transcribe(path)
+                    if not text:
+                        return self._send({"ok": False,
+                                           "error": err or "empty transcript"})
+                    asr_ms = int((time.time() - t0) * 1000)
+                else:
+                    asr_ms = 0
+                sid = qs("conv") or None
+                route = (None, None)
+                if sid:
+                    route = _route_to_instance(str(sid), force=True)
+                else:
+                    sid, _how, route = _pick_target_session(_BLE, -1)
+                ok, msg, detail = deliver_text(
+                    sid, f"[语音] {text}", how="ui", route=route,
+                    wait_max=int(qs("wait", 20)))
+                self._send({"ok": ok, "message": msg, "text": text,
+                            "asr_ms": asr_ms, "conv": str(sid),
+                            "attempts": detail["attempts"],
+                            "waited": round(detail["waited"], 1)})
 
             elif p == "/font":
                 # 字库白名单诊断：确认哪些字符固件能渲染，以及净化效果
@@ -1299,6 +1466,59 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "ascii": (len([c for c in _FONT_CHARS
                                    if ord(c) < 0x80]) if _FONT_CHARS else 0),
                     "samples": [{"in": s, "out": clean(s)} for s in samples],
+                })
+
+            elif p in ("/ui", "/ui/"):
+                a = ui_asset("index.html")
+                if not a:
+                    return self._send({"error": "web ui not found",
+                                       "hint": "打包时未包含 packaging/web"}, 404)
+                self._send_bytes(a.read_bytes(), WEB_MIME[".html"])
+
+            elif p.startswith("/ui/"):
+                a = ui_asset(p[len("/ui/"):])
+                if not a:
+                    return self._send({"error": "not found"}, 404)
+                self._send_bytes(a.read_bytes(),
+                                 WEB_MIME.get(a.suffix.lower(),
+                                              "application/octet-stream"))
+
+            elif p == "/logs":
+                # GUI 日志页：读日志尾部 N 行（默认 300，最多 2000）
+                try:
+                    n = max(1, min(2000, int(qs("tail", 300))))
+                except ValueError:
+                    n = 300
+                lines = []
+                try:
+                    with open(WB_HOME / "wb_bridge.log", "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        lines = fh.readlines()[-n:]
+                except OSError:
+                    pass
+                self._send({"lines": [l.rstrip("\n") for l in lines],
+                            "path": str(WB_HOME / "wb_bridge.log")})
+
+            elif p == "/voice/wav":
+                # 给 <audio> 播：直接回 WAV 字节
+                f = safe_voice_file(qs("file"))
+                if not f:
+                    return self._send({"error": "bad file"}, 400)
+                self._send_bytes(f.read_bytes(), "audio/wav")
+
+            elif p == "/config":
+                self._send({
+                    "model": WHISPER_MODEL,
+                    "lang": WHISPER_LANG,
+                    "port": HTTP_PORT,
+                    "voice_dir": str(VOICE_DIR),
+                    "bridge_dir": str(BRIDGE_DIR),
+                    "web_dir": str(web_dir() or ""),
+                    "log": str(WB_HOME / "wb_bridge.log"),
+                    "models": ["tiny", "base", "small", "medium", "large-v3"],
+                    "whisper": {"installed": _asr_installed(),
+                                "cached": _hf_cached(WHISPER_MODEL),
+                                "loaded": _whisper is not None},
                 })
 
             elif p == "/sim":
@@ -1385,14 +1605,77 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except Exception as e:                # noqa: BLE001
             self._send({"error": "internal", "message": str(e)}, 500)
 
+    def do_POST(self):
+        """只有 /config 用了 POST —— 改 ASR 模型/语言。
+
+        HTTP 端口不能在这里改：服务是"监听端口"本身，改了得整个重启，
+        由 app 启动器通过环境变量 WB_HTTP_PORT 控制。
+        """
+        global WHISPER_MODEL, WHISPER_LANG, _whisper
+        u = urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, OSError):
+            return self._send({"ok": False, "error": "bad json"}, 400)
+
+        try:
+            if u.path == "/config":
+                applied = False
+                m = str(data.get("model") or "").strip()
+                if m and m != WHISPER_MODEL:
+                    WHISPER_MODEL = m
+                    with _whisper_lock:
+                        _whisper = None          # 下次转写时按新模型重载
+                    applied = True
+                    print(f"[ASR] switch model -> {m}（下次转写生效）", flush=True)
+                lg = str(data.get("lang") or "").strip()
+                if lg and lg != WHISPER_LANG:
+                    WHISPER_LANG = lg
+                    applied = True
+                self._send({"ok": True, "applied": applied,
+                            "model": WHISPER_MODEL, "lang": WHISPER_LANG})
+            else:
+                self._send({"error": "not_found", "path": u.path}, 404)
+        except Exception as e:                # noqa: BLE001
+            self._send({"ok": False, "error": str(e)}, 500)
+
     def log_message(self, fmt, *args):
         pass
 
 
 def run_http():
-    # ThreadingHTTPServer：/send 内部有最长 ~7.5s 的退避重试，单线程
-    # HTTPServer 会让诊断请求排队堵死（浏览器 tab 卡住表现为一直转圈）。
-    srv = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), BridgeHandler)
+    """起 HTTP 服务；端口被占就往后挪，并把真实端口写进 PORT_FILE。
+
+    为什么不能让 8765 独占：实测这台机器上有别的程序（自称 MacCleaner 的
+    app.py）占着 8765，直接 bind 会抛 OSError 把整个线程打死，表现就是
+    "服务在跑、工牌也连着，但所有 HTTP 端点 404"。自动挪一个端口 + 落文件
+    让桌面壳和 wbctl 都能找到真实端口。
+    """
+    global HTTP_PORT
+    srv = None
+    for cand in range(HTTP_PORT, HTTP_PORT + 20):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", cand), BridgeHandler)
+            HTTP_PORT = cand
+            break
+        except OSError as e:
+            print(f"[HTTP] 端口 {cand} 不可用（{getattr(e, 'strerror', e)}），换下一个",
+                  flush=True)
+    if srv is None:
+        print("[HTTP] 连续 20 个端口都被占用，HTTP 端点不可用（BLE/ASR 仍工作）",
+              flush=True)
+        return
+
+    try:
+        PORT_FILE.write_text(str(HTTP_PORT), encoding="utf-8")
+    except OSError:
+        pass
+    if HTTP_PORT != 8765:
+        print(f"  HTTP   : http://127.0.0.1:{HTTP_PORT}/   "
+              f"← 8765 被占用，已自动避让", flush=True)
+
     srv.daemon_threads = True
     srv.serve_forever()
 

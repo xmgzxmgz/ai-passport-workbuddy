@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WBBridge · 工牌中转</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<div class="dragbar" id="dragbar"></div>
+<div class="app">
+
+  <!-- 左侧导航 -->
+  <aside class="rail">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round">
+          <path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 11v2"/>
+        </svg>
+      </div>
+      <div class="brand-txt">
+        <b>WBBridge</b>
+        <span>工牌 → WorkBuddy</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-page="dashboard">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>总览</span>
+      </button>
+      <button class="nav-item" data-page="conversations">
+        <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 21l1.9-5.4A8 8 0 1 1 21 12z"/></svg>
+        <span>对话</span>
+        <em class="badge" id="navConvCount"></em>
+      </button>
+      <button class="nav-item" data-page="voice">
+        <svg viewBox="0 0 24 24"><path d="M4 12h2M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>
+        <span>语音</span>
+        <em class="badge" id="navVoiceCount"></em>
+      </button>
+      <button class="nav-item" data-page="logs">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        <span>日志</span>
+      </button>
+      <button class="nav-item" data-page="settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.3a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.7 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 7 2.7h.1A1.7 1.7 0 0 0 8.3 1V1a2 2 0 1 1 4 0v.1A1.7 1.7 0 0 0 15 2.7a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.1a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" transform="translate(0.6 0.6) scale(0.95)"/></svg>
+        <span>设置</span>
+      </button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="rail-status">
+        <span class="dot" id="railDot"></span>
+        <span id="railSvc">服务未连接</span>
+        <em id="railPid"></em>
+      </div>
+      <div class="rail-ble" id="railBle">工牌未连接</div>
+      <div class="rail-btns">
+        <button class="mini" id="btnStop">停止</button>
+        <button class="mini" id="btnRestart">重启</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main>
+    <header class="topbar">
+      <div class="titles">
+        <h1 id="pageTitle">总览</h1>
+        <p id="pageSub">工牌语音 → 本地转写 → 投进 WorkBuddy 对话框</p>
+      </div>
+      <div class="pills">
+        <span class="pill" id="pillSvc">OFFLINE</span>
+        <span class="pill ghost" id="pillModel">—</span>
+      </div>
+    </header>
+
+    <!-- 总览 -->
+    <section class="page" id="page-dashboard">
+      <div class="grid3">
+        <div class="card">
+          <div class="card-head"><span class="label">中转服务</span><span class="dot" id="svcDot"></span></div>
+          <div class="big" id="svcBig">未运行</div>
+          <dl class="kv">
+            <dt>PID</dt><dd id="svcPid">—</dd>
+            <dt>端口</dt><dd id="svcPort">127.0.0.1:8765</dd>
+            <dt>ASR</dt><dd id="svcAsr">—</dd>
+          </dl>
+          <div class="card-foot">
+            <button class="ghost" id="dashRestart">重启服务</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="label">工牌 BLE</span><span class="dot" id="bleDot"></span></div>
+          <div class="big" id="bleBig">未连接</div>
+          <dl class="kv">
+            <dt>设备</dt><dd id="blePeer">—</dd>
+            <dt>MTU</dt><dd id="bleMtu">—</dd>
+            <dt>帧数</dt><dd id="bleFrames">—</dd>
+          </dl>
+          <div class="card-foot"><span class="hint" id="bleErr"></span></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><span class="label">WorkBuddy</span><span class="pill" id="wbPill">—</span></div>
+          <div class="big" id="wbBig">空闲</div>
+          <dl class="kv">
+            <dt>任务</dt><dd id="wbTask">—</dd>
+            <dt>模型</dt><dd id="wbModel">—</dd>
+            <dt>已跑</dt><dd id="wbUptime">—</dd>
+          </dl>
+          <div class="card-foot"><span class="hint">额度 <b id="wbPercent">—</b></span></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <div class="card-head"><span class="label">最近对话</span>
+            <button class="link" data-goto="conversations">全部 →</button></div>
+          <div class="list compact" id="dashConvs"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span class="label">最近录音</span>
+            <button class="link" data-goto="voice">全部 →</button></div>
+          <div class="list compact" id="dashVoice"></div>
+        </div>
+      </div>
+
+      <div class="card actions">
+        <span class="label">快捷操作</span>
+        <div class="spacer"></div>
+        <button class="ghost" id="actPush">推送一次</button>
+        <button class="ghost" id="actLog">打开日志</button>
+        <button class="ghost" id="actVoiceDir">语音目录</button>
+        <button class="ghost" id="actDiag">诊断页</button>
+        <button class="ghost" id="actRefresh">刷新</button>
+      </div>
+    </section>
+
+    <!-- 对话 -->
+    <section class="page hidden" id="page-conversations">
+      <div class="split">
+        <div class="pane list-pane">
+          <div class="pane-head">
+            <input id="convSearch" class="input search" placeholder="搜索对话">
+          </div>
+          <div class="list scroll" id="convList"></div>
+        </div>
+        <div class="pane detail-pane">
+          <div class="pane-head detail-head">
+            <div>
+              <div class="detail-title" id="convTitle">选择一个对话</div>
+              <div class="detail-sub" id="convMeta"></div>
+            </div>
+            <button class="ghost" id="btnReloadMsgs">刷新</button>
+          </div>
+          <div class="msgs scroll" id="msgList"></div>
+          <div class="composer">
+            <input id="draft" class="input" placeholder="直接发一句话到这个对话（走和工牌同一条投递链路）">
+            <button class="primary" id="btnSend">发送</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 语音 -->
+    <section class="page hidden" id="page-voice">
+      <div class="split">
+        <div class="pane list-pane">
+          <div class="pane-head"><span class="label" id="voiceCountLabel">录音</span>
+            <button class="ghost sm" id="btnVoiceDir2">目录</button></div>
+          <div class="list scroll" id="voiceList"></div>
+        </div>
+        <div class="pane detail-pane">
+          <div class="voice-head">
+            <button class="play-btn" id="btnPlay">▶</button>
+            <div class="voice-meta">
+              <b id="voiceName">—</b>
+              <span id="voiceSub">—</span>
+            </div>
+            <button class="ghost" id="btnAsr">重新转写</button>
+          </div>
+          <audio id="player" hidden></audio>
+          <div class="field">
+            <span class="label">转写文本（可编辑后投递）</span>
+            <textarea id="transcript" class="textarea" placeholder="还没有转写 —— 点右上「重新转写」，或直接手输要投递的话"></textarea>
+          </div>
+          <div class="deliver">
+            <span class="label">投递目标</span>
+            <select id="targetConv" class="select"></select>
+            <button class="primary" id="btnDeliver">投递这条</button>
+            <button class="ghost" id="btnCopy">复制文本</button>
+          </div>
+          <p class="hint">投递会走和工牌完全相同的链路：等目标会话空闲 → 按对话路由 → 回读记录验真。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="page hidden" id="page-logs">
+      <div class="logs-bar">
+        <input id="logFilter" class="input search" placeholder="过滤（SEND / BLE / ASR / 错误…）">
+        <label class="check"><input type="checkbox" id="logAuto" checked> 自动滚动</label>
+        <label class="check"><input type="checkbox" id="logQuiet" checked> 只看重要</label>
+        <div class="spacer"></div>
+        <button class="ghost" id="btnOpenLog">打开日志文件</button>
+      </div>
+      <pre class="logview" id="logView"></pre>
+    </section>
+
+    <!-- 设置 -->
+    <section class="page hidden" id="page-settings">
+      <div class="card">
+        <div class="card-head"><span class="label">语音识别</span></div>
+        <div class="form">
+          <label>模型
+            <select id="cfgModel" class="select"></select>
+          </label>
+          <label>语言
+            <input id="cfgLang" class="input short" placeholder="zh">
+          </label>
+          <button class="primary" id="cfgSave">保存并应用</button>
+        </div>
+        <p class="hint">换模型会清掉内存里的旧模型，下次转写时按新模型重载（首次要下载权重）。small ≈ 483MB，medium ≈ 1.5GB。</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="label">环境</span></div>
+        <dl class="info" id="cfgInfo"></dl>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="label">关于</span></div>
+        <p class="about">
+          WBBridge 把 AI Passport 工牌变成 WorkBuddy 的语音终端：工牌录音 → BLE → 本机 Whisper 转写 →
+          按对话路由投进 WorkBuddy 窗口。本页面是中转服务自带的本地控制台，只监听 127.0.0.1。
+        </p>
+        <div class="row">
+          <button class="ghost" id="btnOpenLog2">打开日志</button>
+          <button class="ghost" id="btnVoiceDir3">语音目录</button>
+          <button class="ghost" id="btnDiag2">诊断页</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast hidden" id="toast"></div>
+  <div class="busy hidden" id="busy"><span class="spinner"></span><span id="busyTxt">处理中…</span></div>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>

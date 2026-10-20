@@ -1,243 +1,239 @@
-// ---------------------------------------------------------------------------
-// WBBridge 菜单栏应用
-//
-// 之前的启动器是 shell 脚本（LSUIElement 后台进程）：双击没反应、不知道
-// 有没有在跑、也没法停 —— 用户视角就是"打不开"。这个版本换成真 NSStatusItem：
-//
-//   · 菜单栏常驻一个波形图标，形状/颜色反映服务与工牌状态
-//   · 点开就是状态面板：服务 pid、工牌 peer/MTU、对话条数
-//   · 菜单里能打开日志、重启、停止、退出
-//   · 自己拉起 python 子进程 wb_bridge.py，并转发 SIGTERM
-//   · 如果 8765 已被别的进程占用（例如终端里手动跑的），进入"接管"模式：
-//     不重复启动，只做监控 + 提供停止
-//
-// 编译：swiftc -O -swift-version 5 -framework AppKit main.swift -o WBBridge
-// ---------------------------------------------------------------------------
-
 import AppKit
-import Foundation
+import WebKit
+
+// ---------------------------------------------------------------------------
+// WBBridge 桌面壳
+//
+// 界面是服务自带的本地控制台（GET /ui），这里只负责：
+//   · 一个原生窗口 + WKWebView 承载它（关窗不退出，缩到菜单栏）
+//   · 菜单栏图标：服务/工牌状态一眼可见，带启停入口
+//   · 拉起 / 停止 python 子进程，把设置（模型、语言、端口）通过环境变量注入
+//   · 给网页提供原生桥（打开日志 / 打开目录 / 重启服务）
+//
+// 为什么不是原生控件界面：这台机器只有 Command Line Tools，没有 Xcode，
+// SwiftUI 的 @State 等宏缺 libSwiftUIMacros.dylib 编译不过；纯 AppKit 手写
+// 全部控件成本高、迭代慢。本地 Web 控制台既好写，又能直接在浏览器里用。
+// ---------------------------------------------------------------------------
 
 let HOME = NSHomeDirectory()
 let WB_HOME = HOME + "/.workbuddy"
 let LOG_PATH = WB_HOME + "/wb_bridge.log"
 let PID_PATH = WB_HOME + "/wb_bridge.pid"
-let PORT = 8765
 
-// MARK: - 状态快照
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+                         NSMenuDelegate, WKScriptMessageHandler {
 
-struct Snapshot {
-    var serviceUp = false
-    var pid: Int32 = 0
-    var adopted = false          // 端口被外部进程占用（不是我们拉起的）
-    var peer: String = ""
-    var bleConnected = false
-    var mtu = 0
-    var convCount = -1
-    var checkedAt = Date.distantPast
-
-    var bleLine: String {
-        if bleConnected {
-            let short = peer.count > 17 ? String(peer.prefix(17)) : peer
-            return "工牌：已连接 \(short) · MTU \(mtu)"
-        }
-        return "工牌：未连接"
-    }
-
-    var serviceLine: String {
-        if !serviceUp { return "服务：未运行" }
-        let who = adopted ? "外部进程" : "本应用拉起"
-        return "服务：运行中 · pid \(pid) · \(who)"
-    }
-}
-
-// MARK: - 应用
-
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-
+    private var window: NSWindow!
+    private var web: WKWebView!
     private var statusItem: NSStatusItem!
     private var child: Process?
     private var logHandle: FileHandle?
-    private var snapshot = Snapshot()
-    private var refreshTimer: Timer?
-    private var shownMissingDepsAlert = false
+    private var timer: Timer?
 
-    // --- 路径 -------------------------------------------------------------
+    private var serviceUp = false
+    private var bleConnected = false
+    private var bleMtu = 0
+    private var taskText = ""
+    private var showingUI = false
+    private var retryWork: DispatchWorkItem?
 
-    /// 代码目录：打包后在 Resources/bridge；源码目录里直接跑时在 .app 上一级。
-    private var bridgeDir: URL? {
-        let fm = FileManager.default
-        if let res = Bundle.main.resourceURL {
-            let packed = res.appendingPathComponent("bridge")
-            if fm.fileExists(atPath: packed.appendingPathComponent("wb_bridge.py").path) {
-                return packed
-            }
+    /// 真实端口来自服务写的 ~/.workbuddy/http.port（8765 被占时服务会自动挪）。
+    private var port: Int {
+        if let s = try? String(contentsOfFile: WB_HOME + "/http.port", encoding: .utf8),
+           let v = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)), v > 1024 {
+            return v
         }
-        let dev = Bundle.main.bundleURL.deletingLastPathComponent()
-        if fm.fileExists(atPath: dev.appendingPathComponent("wb_bridge.py").path) {
-            return dev
-        }
-        return nil
+        let v = UserDefaults.standard.integer(forKey: "port")
+        return v > 1024 && v < 65536 ? v : 8765
     }
 
-    // --- 生命周期 ---------------------------------------------------------
+    // app=1 让前端知道自己在原生窗口里：留出标题栏高度、顶部加可拖拽条
+    private var uiURL: URL { URL(string: "http://127.0.0.1:\(port)/ui?app=1")! }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+    // MARK: - 生命周期
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+
+        buildMainMenu()
+        buildWindow()
+        buildStatusItem()
+
         try? FileManager.default.createDirectory(atPath: WB_HOME + "/voice_out",
                                                 withIntermediateDirectories: true)
-        setupStatusItem()
-        ensureWritableDirs()
-        startService()
-        refreshNow()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.refreshNow()
+
+        appendLog("app 启动，port=\(port)")
+        if probeUp() {
+            showingUI = true
+            loadUI()
+        } else {
+            startService()
+            loadPlaceholder(reason: "正在启动服务…")
+            scheduleReload()
         }
+
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication,
-                                       hasVisibleWindows flag: Bool) -> Bool {
-        // 重复双击 app 时把菜单弹出来，至少让用户看到"我在这儿"
-        statusItem.button?.performClick(nil)
+    func applicationWillTerminate(_ n: Notification) {
+        timer?.invalidate()
+        if let p = child, p.isRunning { p.terminate() }
+    }
+
+    func applicationShouldHandleReopen(_ s: NSApplication, hasVisibleWindows f: Bool) -> Bool {
+        showWindow()
         return true
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
-        stopService(removePidFile: true)
+    // MARK: - 窗口
+
+    private func buildWindow() {
+        let cfg = WKWebViewConfiguration()
+        let ucc = WKUserContentController()
+        ucc.add(self, name: "wb")
+        cfg.userContentController = ucc
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 780),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable,
+                                     .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "WBBridge · 工牌中转"
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
+        w.backgroundColor = NSColor(srgbRed: 0.051, green: 0.067, blue: 0.090, alpha: 1)
+        w.minSize = NSSize(width: 1020, height: 660)
+        w.delegate = self
+
+        let web = WKWebView(frame: w.contentView?.bounds ?? .zero, configuration: cfg)
+        web.autoresizingMask = [.width, .height]
+        web.setValue(false, forKey: "drawsBackground")
+        w.contentView = web
+
+        self.web = web
+        self.window = w
+        w.center()
     }
 
-    // 关窗口不退出
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false
+    func windowShouldClose(_ s: NSWindow) -> Bool {
+        s.orderOut(nil)          // 关窗不退出：留在菜单栏
+        return false
     }
 
-    // --- 菜单栏 -----------------------------------------------------------
-
-    private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "waveform.circle",
-                                   accessibilityDescription: "WBBridge")
-            button.image?.isTemplate = true
-            button.toolTip = "WBBridge 工牌中转"
-        }
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
+    private func showWindow() {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        refreshSnapshotSync()
+    // MARK: - 页面
 
-        menu.addItem(disabled(snapshot.serviceLine))
-        if snapshot.serviceUp {
-            menu.addItem(disabled(snapshot.bleLine))
-        }
-        if snapshot.convCount >= 0 {
-            menu.addItem(disabled("对话：\(snapshot.convCount) 条"))
-        }
-
-        menu.addItem(.separator())
-
-        if snapshot.serviceUp {
-            menu.addItem(item("重启服务", #selector(restartService)))
-            menu.addItem(item("停止服务", #selector(stopServiceAction)))
-            menu.addItem(item("打开诊断页", #selector(openDiagPage)))
-        } else {
-            menu.addItem(item("启动服务", #selector(startServiceAction)))
-        }
-        menu.addItem(item("打开日志", #selector(openLogAction)))
-
-        menu.addItem(.separator())
-        menu.addItem(item("退出 WBBridge", #selector(quitApp), key: "q"))
+    private func loadUI() {
+        web.load(URLRequest(url: uiURL, cachePolicy: .reloadIgnoringLocalCacheData))
     }
 
-    private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
-        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        it.target = self
-        return it
-    }
-
-    private func disabled(_ title: String) -> NSMenuItem {
-        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        it.isEnabled = false
-        return it
-    }
-
-    // --- 状态刷新 ---------------------------------------------------------
-
-    /// 菜单打开时同步取一次（本地环回，几十毫秒）。用短超时，避免服务挂了
-    /// 时候点菜单要转好几秒。
-    private func refreshSnapshotSync() {
-        let snap = probe(quick: true)
-        DispatchQueue.main.async { self.apply(snap) }
-    }
-
-    private func refreshNow() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+    /// 启动服务后端口要等几秒才可用 —— 轮询到能响应再切到控制台
+    private func scheduleReload() {
+        retryWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            let snap = self.probe()
-            DispatchQueue.main.async { self.apply(snap) }
+            if self.probeUp() {
+                self.showingUI = true
+                self.loadUI()
+            } else {
+                if self.child == nil || !(self.child?.isRunning ?? false) {
+                    self.startService()
+                }
+                self.scheduleReload()
+            }
         }
+        retryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
-    private func probe(quick: Bool = false) -> Snapshot {
-        var s = Snapshot()
-        s.checkedAt = Date()
-        let timeout: TimeInterval = quick ? 0.5 : 1.2
+    private func loadPlaceholder(reason: String) {
+        showingUI = false
+        let html = """
+        <!doctype html><html><head><meta charset="utf-8">
+        <style>
+          :root { color-scheme: dark; }
+          body { margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
+                 background:#0d1117; color:#e6edf3;
+                 font:13px/1.6 -apple-system,"PingFang SC",sans-serif; -webkit-user-select:none }
+          .box { text-align:center; max-width:470px }
+          .ring { width:52px; height:52px; margin:0 auto 18px; border-radius:50%;
+                  border:2px solid rgba(64,208,214,.2); border-top-color:#40d0d6;
+                  animation:spin 1s linear infinite }
+          @keyframes spin { to { transform:rotate(360deg) } }
+          h1 { font-size:16px; font-weight:600; margin:0 0 6px }
+          p { color:#8b949e; font-size:12px; margin:0 0 18px }
+          button { font:inherit; font-size:12px; padding:6px 14px; margin:0 4px;
+                   border-radius:7px; cursor:pointer;
+                   border:1px solid #252c38; background:#1b222c; color:#e6edf3 }
+          button:hover { border-color:#38414f }
+          .hint { margin-top:16px; font-size:10.5px; color:#5a6472 }
+        </style></head><body>
+        <div class="box">
+          <div class="ring"></div>
+          <h1>中转服务未就绪</h1>
+          <p>\(reason)</p>
+          <button onclick="send('start')">启动服务</button>
+          <button onclick="send('openLog')">打开日志</button>
+          <button onclick="location.reload()">重试</button>
+          <div class="hint">日志：~/.workbuddy/wb_bridge.log</div>
+        </div>
+        <script>
+          function send(cmd) {
+            try { window.webkit.messageHandlers.wb.postMessage({ cmd: cmd }); } catch (e) {}
+          }
+        </script></body></html>
+        """
+        web.loadHTMLString(html, baseURL: nil)
+    }
 
-        let ble = getJSON("/ble", timeout: timeout)
-        let status = getJSON("/status", timeout: timeout)
-        if ble != nil || status != nil {
-            s.serviceUp = true
-            s.pid = currentServicePid()
-            s.adopted = (child == nil)
-            if let b = ble {
-                s.bleConnected = (b["connected"] as? Bool) ?? false
-                s.peer = (b["peer"] as? String) ?? ""
-                s.mtu = (b["mtu"] as? Int) ?? 0
+    // MARK: - 轮询
+
+    private func poll() {
+        let up = probeUp()
+        serviceUp = up
+        if up {
+            if let d = getJSON("/ble") {
+                bleConnected = (d["connected"] as? Bool) ?? false
+                bleMtu = (d["mtu"] as? Int) ?? 0
             }
-            if let c = getJSON("/conversations", timeout: timeout),
-               let items = c["items"] as? [[String: Any]] {
-                s.convCount = items.count
+            if let s = getJSON("/status") {
+                taskText = (s["task"] as? String) ?? ""
+            }
+            if !showingUI {
+                showingUI = true
+                loadUI()
             }
         } else {
-            s.serviceUp = false
-            s.adopted = false
+            bleConnected = false
+            if showingUI {
+                loadPlaceholder(reason: "服务进程已经不在了。点「启动服务」重新拉起。")
+            }
         }
-        return s
+        updateIcon()
     }
 
-    private func apply(_ s: Snapshot) {
-        snapshot = s
-        guard let button = statusItem.button else { return }
-
-        let symbol: String
-        if !s.serviceUp {
-            symbol = "waveform.slash"
-        } else if s.bleConnected {
-            symbol = "waveform.circle.fill"
-        } else {
-            symbol = "waveform.circle"
-        }
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "WBBridge")
-        button.image?.isTemplate = true
-        button.toolTip = s.serviceUp
-            ? "WBBridge · \(s.bleConnected ? "工牌已连接" : "等待工牌") · pid \(s.pid)"
-            : "WBBridge · 服务未运行"
+    private func probeUp() -> Bool {
+        getJSON("/health", timeout: 1.0) != nil || getJSON("/status", timeout: 1.0) != nil
     }
 
-    private func getJSON(_ path: String, timeout: TimeInterval = 1.2) -> [String: Any]? {
-        guard let url = URL(string: "http://127.0.0.1:\(PORT)\(path)") else { return nil }
-        var req = URLRequest(url: url)
+    private func getJSON(_ path: String, timeout: TimeInterval = 2.0) -> [String: Any]? {
+        guard let u = URL(string: "http://127.0.0.1:\(port)\(path)") else { return nil }
+        var req = URLRequest(url: u)
         req.timeoutInterval = timeout
+        req.cachePolicy = .reloadIgnoringLocalCacheData
         let sem = DispatchSemaphore(value: 0)
         var out: [String: Any]?
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let d = data,
-               let obj = try? JSONSerialization.jsonObject(with: d),
-               let dict = obj as? [String: Any] {
+        URLSession.shared.dataTask(with: req) { d, _, _ in
+            if let d, let o = try? JSONSerialization.jsonObject(with: d),
+               let dict = o as? [String: Any] {
                 out = dict
             }
             sem.signal()
@@ -246,126 +242,215 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return out
     }
 
-    // --- 服务的启停 -------------------------------------------------------
+    // MARK: - 服务的启停
+
+    private func resolveBridgeDir() -> URL? {
+        let fm = FileManager.default
+        if let env = ProcessInfo.processInfo.environment["WB_BRIDGE_DIR"],
+           fm.fileExists(atPath: env + "/wb_bridge.py") {
+            return URL(fileURLWithPath: env)
+        }
+        if let res = Bundle.main.resourceURL {
+            let p = res.appendingPathComponent("bridge")
+            if fm.fileExists(atPath: p.appendingPathComponent("wb_bridge.py").path) { return p }
+        }
+        let dev = Bundle.main.bundleURL.deletingLastPathComponent()
+        if fm.fileExists(atPath: dev.appendingPathComponent("wb_bridge.py").path) { return dev }
+        return nil
+    }
+
+    private func findPython() -> String? {
+        var cands: [String] = []
+        if let e = ProcessInfo.processInfo.environment["WB_PYTHON"], !e.isEmpty { cands.append(e) }
+        if let res = Bundle.main.resourceURL {
+            cands.append(res.appendingPathComponent("venv/bin/python3").path)
+        }
+        cands.append(WB_HOME + "/binaries/python/envs/default/bin/python")
+        cands.append("/opt/homebrew/bin/python3")
+        cands.append("/usr/local/bin/python3")
+        cands.append("/usr/bin/python3")
+        for py in cands where FileManager.default.isExecutableFile(atPath: py) {
+            if runSilent(py, ["-c", "import bleak, numpy"]) { return py }
+        }
+        return nil
+    }
 
     private func startService() {
-        guard child == nil else { return }
-        if getJSON("/status", timeout: 0.5) != nil {
-            // 已经有实例在跑（终端里起的 / 上一个 app 残留），不重复启动
-            appendLog("menubar: 8765 已被占用，进入接管模式")
-            snapshot.serviceUp = true
-            snapshot.adopted = true
-            return
-        }
-        guard let dir = bridgeDir else {
-            alert("找不到服务代码",
-                  "wb_bridge.py 不在 app 的 Resources/bridge 里，也不是源码目录布局。请重新打包。")
+        if let c = child, c.isRunning { return }
+        guard let dir = resolveBridgeDir() else {
+            alert("找不到服务代码", "app 的 Resources/bridge 里没有 wb_bridge.py。请重新打包，或用 WB_BRIDGE_DIR 指定。")
+            loadPlaceholder(reason: "找不到 wb_bridge.py —— 请重新打包。")
             return
         }
         guard let py = findPython() else {
-            if !shownMissingDepsAlert {
-                shownMissingDepsAlert = true
-                alert("缺少 Python 依赖",
-                      "没找到同时装有 bleak 和 numpy 的 Python。\n\n先安装依赖：\n  pip3 install -r \"\(dir.path)/requirements.txt\"\n\n或用环境变量指定解释器：\n  launchctl setenv WB_PYTHON /path/to/python3")
-            }
+            alert("缺少 Python 依赖",
+                  "没找到同时装有 bleak 和 numpy 的 Python。\n\n  pip3 install -r \"\(dir.path)/requirements.txt\"\n\n或指定解释器：\n  launchctl setenv WB_PYTHON /path/to/python3")
+            loadPlaceholder(reason: "缺少 Python 依赖（bleak / numpy）—— 见弹出的说明。")
             return
         }
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: py)
-        proc.arguments = ["-u", "wb_bridge.py"]
-        proc.currentDirectoryURL = dir
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: py)
+        p.arguments = ["-u", "wb_bridge.py"]
+        p.currentDirectoryURL = dir
 
         var env = ProcessInfo.processInfo.environment
+        let d = UserDefaults.standard
         env["PYTHONUNBUFFERED"] = "1"
         env["WB_HOME"] = WB_HOME
         env["WB_VOICE_DIR"] = WB_HOME + "/voice_out"
         env["WB_GW_CACHE"] = WB_HOME + "/.gw_cache.json"
-        proc.environment = env
+        env["WB_HTTP_PORT"] = "\(port)"
+        if let m = d.string(forKey: "whisperModel"), !m.isEmpty { env["WB_WHISPER_MODEL"] = m }
+        if let l = d.string(forKey: "whisperLang"), !l.isEmpty { env["WB_WHISPER_LANG"] = l }
+        p.environment = env
 
-        let fh = openLog()
-        proc.standardOutput = fh
-        proc.standardError = fh
-
-        proc.terminationHandler = { [weak self] p in
+        if let h = openLog() {
+            p.standardOutput = h
+            p.standardError = h
+        }
+        p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if self.child === p {
-                    self.child = nil
-                }
-                self.appendLog("menubar: 服务进程退出 code=\(p.terminationStatus)")
-                self.refreshNow()
+                if self.child === proc { self.child = nil }
+                self.appendLog("服务退出 code=\(proc.terminationStatus)")
+                self.serviceUp = false
+                self.updateIcon()
             }
         }
 
         do {
-            try proc.run()
-            child = proc
-            try? "\(proc.processIdentifier)\n".data(using: .utf8)?
+            try? FileManager.default.removeItem(atPath: WB_HOME + "/http.port")
+            try p.run()
+            child = p
+            try? "\(p.processIdentifier)\n".data(using: .utf8)?
                 .write(to: URL(fileURLWithPath: PID_PATH))
-            appendLog("menubar: 启动服务 pid=\(proc.processIdentifier) py=\(py)")
+            appendLog("启动服务 pid=\(p.processIdentifier) py=\(py)")
+            serviceUp = true
+            updateIcon()
         } catch {
             alert("服务启动失败", error.localizedDescription)
         }
     }
 
-    private func stopService(removePidFile: Bool = true) {
-        guard let p = child else {
-            // 接管模式下没有 child，按端口找进程
-            let pid = currentServicePid()
-            if pid > 0 { kill(pid, SIGTERM) }
-            if removePidFile { try? FileManager.default.removeItem(atPath: PID_PATH) }
-            return
+    private func stopService() {
+        if let p = child, p.isRunning {
+            p.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
         }
         child = nil
-        p.terminate()
-        // 给它 5 秒优雅退出
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
-            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-        }
-        if removePidFile { try? FileManager.default.removeItem(atPath: PID_PATH) }
-        appendLog("menubar: 停止服务")
+        try? FileManager.default.removeItem(atPath: PID_PATH)
+        appendLog("停止服务")
+        serviceUp = false
+        updateIcon()
     }
 
-    private func currentServicePid() -> Int32 {
-        if let c = child, c.isRunning { return c.processIdentifier }
-        if let txt = try? String(contentsOfFile: PID_PATH, encoding: .utf8),
-           let pid = Int32(txt.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
-           processIsBridge(pid) {
-            return pid
+    private func restartService() {
+        stopService()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.startService()
+            self.scheduleReload()
         }
-        // 兜底：从监听端口反查
-        if let out = runCapture("/usr/sbin/lsof", ["-nP", "-iTCP:\(PORT)", "-sTCP:LISTEN", "-t"]),
-           let pid = Int32(out.components(separatedBy: .newlines).first ?? "") {
-            return pid
-        }
-        return 0
     }
 
-    private func processIsBridge(_ pid: Int32) -> Bool {
-        guard let out = runCapture("/bin/ps", ["-p", "\(pid)", "-o", "command="]) else { return false }
-        return out.contains("wb_bridge.py")
+    // MARK: - 菜单栏
+
+    private func buildStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let b = statusItem.button {
+            b.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "WBBridge")
+            b.image?.isTemplate = true
+        }
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+        updateIcon()
     }
 
-    // --- 小工具 -----------------------------------------------------------
+    private func updateIcon() {
+        guard let b = statusItem?.button else { return }
+        let name = !serviceUp ? "waveform.slash"
+            : (bleConnected ? "waveform.circle.fill" : "waveform.circle")
+        b.image = NSImage(systemSymbolName: name, accessibilityDescription: "WBBridge")
+        b.image?.isTemplate = true
+        b.toolTip = !serviceUp ? "WBBridge · 服务未运行"
+            : (bleConnected ? "WBBridge · 工牌已连接 · MTU \(bleMtu)" : "WBBridge · 等待工牌")
+    }
 
-    private func findPython() -> String? {
-        var candidates: [String] = []
-        if let e = ProcessInfo.processInfo.environment["WB_PYTHON"], !e.isEmpty {
-            candidates.append(e)
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        add(menu, "打开控制台", #selector(openWindowAction))
+        menu.addItem(.separator())
+        add(menu, serviceUp ? "服务：运行中 · pid \(child?.processIdentifier ?? 0)" : "服务：未运行", enabled: false)
+        if serviceUp {
+            add(menu, bleConnected ? "工牌：已连接 · MTU \(bleMtu)" : "工牌：未连接", enabled: false)
+            if !taskText.isEmpty {
+                add(menu, "任务：\(taskText.prefix(26))", enabled: false)
+            }
         }
-        if let res = Bundle.main.resourceURL {
-            candidates.append(res.appendingPathComponent("venv/bin/python3").path)
-        }
-        candidates.append(WB_HOME + "/binaries/python/envs/default/bin/python")
-        candidates.append("/opt/homebrew/bin/python3")
-        candidates.append("/usr/local/bin/python3")
-        candidates.append("/usr/bin/python3")
+        menu.addItem(.separator())
+        add(menu, serviceUp ? "停止服务" : "启动服务", #selector(toggleService))
+        add(menu, "重启服务", #selector(restartAction))
+        add(menu, "打开日志", #selector(openLogAction))
+        menu.addItem(.separator())
+        add(menu, "退出 WBBridge", #selector(quitAction), key: "q")
+    }
 
-        for py in candidates where FileManager.default.isExecutableFile(atPath: py) {
-            if runSilent(py, ["-c", "import bleak, numpy"]) { return py }
+    private func add(_ menu: NSMenu, _ title: String, _ sel: Selector? = nil,
+                     key: String = "", enabled: Bool = true) {
+        let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+        if sel != nil { it.target = self }
+        it.isEnabled = enabled
+        menu.addItem(it)
+    }
+
+    @objc private func openWindowAction() { showWindow() }
+    @objc private func toggleService() { serviceUp ? stopService() : startService() }
+    @objc private func restartAction() { restartService() }
+    @objc private func openLogAction() { NSWorkspace.shared.open(URL(fileURLWithPath: LOG_PATH)) }
+    @objc private func quitAction() { stopService(); NSApp.terminate(nil) }
+
+    // MARK: - 网页原生桥
+
+    func userContentController(_ u: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let cmd = body["cmd"] as? String else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch cmd {
+            case "openLog":   NSWorkspace.shared.open(URL(fileURLWithPath: LOG_PATH))
+            case "openVoice": NSWorkspace.shared.open(URL(fileURLWithPath: WB_HOME + "/voice_out"))
+            case "openDiag":
+                if let s = body["url"] as? String, let u = URL(string: s) { NSWorkspace.shared.open(u) }
+            case "stop":      self.stopService()
+            case "start":     self.startService(); self.scheduleReload()
+            case "restart":   self.restartService()
+            default:          break
+            }
         }
-        return nil
+    }
+
+    // MARK: - 杂项
+
+    private func openLog() -> FileHandle? {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: LOG_PATH) { fm.createFile(atPath: LOG_PATH, contents: nil) }
+        guard let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: LOG_PATH)) else { return nil }
+        h.seekToEndOfFile()
+        logHandle = h
+        return h
+    }
+
+    private func appendLog(_ msg: String) {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "=== \(f.string(from: Date())) [app] \(msg) ===\n"
+        if let h = logHandle ?? openLog(), let d = line.data(using: .utf8) {
+            h.seekToEndOfFile()
+            h.write(d)
+        }
     }
 
     private func runSilent(_ path: String, _ args: [String]) -> Bool {
@@ -374,50 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        do {
-            try p.run()
-            p.waitUntilExit()
-            return p.terminationStatus == 0
-        } catch { return false }
-    }
-
-    private func runCapture(_ path: String, _ args: [String]) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func ensureWritableDirs() {
-        try? FileManager.default.createDirectory(atPath: WB_HOME, withIntermediateDirectories: true)
-    }
-
-    private func openLog() -> FileHandle? {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: LOG_PATH) {
-            fm.createFile(atPath: LOG_PATH, contents: nil)
-        }
-        guard let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: LOG_PATH)) else { return nil }
-        h.seekToEndOfFile()
-        logHandle = h
-        return h
-    }
-
-    private func appendLog(_ msg: String) {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let line = "=== \(fmt.string(from: Date())) [menubar] \(msg) ===\n"
-        if let h = logHandle ?? openLog(), let d = line.data(using: .utf8) {
-            h.seekToEndOfFile()
-            h.write(d)
-        }
+        do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
     }
 
     private func alert(_ title: String, _ body: String) {
@@ -430,40 +472,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.runModal()
     }
 
-    // --- 菜单动作 ---------------------------------------------------------
+    private func buildMainMenu() {
+        let main = NSMenu()
 
-    @objc private func startServiceAction() { startService(); refreshNow() }
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于 WBBridge",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let logItem = NSMenuItem(title: "打开日志", action: #selector(openLogAction), keyEquivalent: "l")
+        logItem.target = self
+        appMenu.addItem(logItem)
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "隐藏 WBBridge",
+                        action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "退出 WBBridge",
+                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
 
-    @objc private func stopServiceAction() {
-        stopService()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.refreshNow() }
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        let viewItem = NSMenuItem()
+        let view = NSMenu(title: "显示")
+        let reload = NSMenuItem(title: "重新载入控制台", action: #selector(reloadUI), keyEquivalent: "r")
+        reload.target = self
+        view.addItem(reload)
+        viewItem.submenu = view
+        main.addItem(viewItem)
+
+        NSApp.mainMenu = main
     }
 
-    @objc private func restartService() {
-        stopService()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.startService()
-            self.refreshNow()
-        }
-    }
-
-    @objc private func openLogAction() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: LOG_PATH))
-    }
-
-    @objc private func openDiagPage() {
-        if let url = URL(string: "http://127.0.0.1:\(PORT)/status") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func quitApp() {
-        stopService()
-        NSApp.terminate(nil)
+    @objc private func reloadUI() {
+        if serviceUp { loadUI() } else { loadPlaceholder(reason: "服务未就绪") }
     }
 }
-
-// MARK: - 入口
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

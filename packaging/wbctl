@@ -17,7 +17,8 @@ APP="${WB_APP:-/Applications/WBBridge.app}"
 WB_HOME_DIR="${WB_HOME:-$HOME/.workbuddy}"
 LOG="$WB_HOME_DIR/wb_bridge.log"
 PIDFILE="$WB_HOME_DIR/wb_bridge.pid"
-PORT="${WB_HTTP_PORT:-8765}"
+# 端口：优先环境变量，其次读服务写的 http.port（8765 被占时服务会自动挪），最后回退 8765
+PORT="${WB_HTTP_PORT:-$(cat "$WB_HOME_DIR/http.port" 2>/dev/null || echo 8765)}"
 
 pid() {
   local p
