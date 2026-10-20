@@ -9,7 +9,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>WBBridge 工牌中转</string>
 	<key>CFBundleExecutable</key>
-	<string>wb-bridge</string>
+	<string>WBBridge</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleSignature</key>

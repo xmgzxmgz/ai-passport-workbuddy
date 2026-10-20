@@ -46,7 +46,12 @@ case "${1:-status}" in
       rm -f "$PIDFILE"
       echo "已停止 (pid $p)"
     else
-      echo "未在运行"
+      echo "服务未在运行"
+    fi
+    # 菜单栏壳一并退出，否则它会在菜单里显示"服务未运行"继续挂着
+    if pgrep -f "WBBridge.app/Contents/MacOS/WBBridge" >/dev/null 2>&1; then
+      osascript -e 'quit app "WBBridge"' >/dev/null 2>&1
+      echo "菜单栏图标已退出"
     fi
     ;;
   restart)

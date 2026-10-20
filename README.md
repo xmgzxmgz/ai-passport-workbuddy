@@ -180,27 +180,31 @@ python wb_bridge.py
 ### 4. 打包成 DMG（实现细节）
 
 ```bash
-./scripts/build_dmg.sh            # 出 dist/WBBridge-1.0.0.dmg（当前 ~340KB）
+./scripts/build_dmg.sh            # 出 dist/WBBridge-1.0.0.dmg（当前 ~376KB）
 ./scripts/build_dmg.sh --no-icon  # 跳过图标重绘
 ```
 
 `scripts/build_dmg.sh` 做的事：
 
 1. `bridge/*.py` 用 `rsync` 塞进 `WBBridge.app/Contents/Resources/bridge/`（排除 `voice_out/`、`.gw_cache.json`、`__pycache__`）；
-2. 拷 `packaging/Info.plist` —— 里面两条 `NSBluetooth*UsageDescription` 是**硬需求**，缺了 python 一碰 CoreBluetooth 就被 SIGKILL（exit 137）；
-3. `codesign --force --deep --sign -` 做 ad-hoc 签名（内容一变必须重签，否则 TCC 把蓝牙授权判成另一个应用）；
-4. `hdiutil create -format UDZO` 出盘，自动挂载自检内容。
+2. `swiftc -O` 编译 `packaging/menubar/main.swift` → `Contents/MacOS/WBBridge`（菜单栏壳，见下）；
+3. 拷 `packaging/Info.plist` —— 里面两条 `NSBluetooth*UsageDescription` 是**硬需求**，缺了 python 一碰 CoreBluetooth 就被 SIGKILL（exit 137）；
+4. `codesign --force --deep --sign -` 做 ad-hoc 签名（内容一变必须重签，否则 TCC 把蓝牙授权判成另一个应用）；
+5. `hdiutil create -format UDZO` 出盘，自动挂载自检内容。
 
-启动器 `packaging/launcher/wb-bridge` 的四个关键行为：
+**菜单栏壳**（`packaging/menubar/main.swift`，~450 行 Swift/AppKit）：
 
 | 行为 | 为什么 |
 |---|---|
-| 按 bundle 相对路径解析代码目录 | 源码目录 / `/Applications` / DMG 挂载点三种位置都能跑，不写死绝对路径 |
-| 依次探测解释器（`WB_PYTHON` → bundle 内 venv → 托管 venv → Homebrew → 系统），逐个验证能否 `import bleak, numpy` | 不打包 Python 运行时（带 faster-whisper 好几百 MB），缺依赖时弹窗说清楚怎么装 |
+| `NSStatusItem` 常驻图标：实心=工牌已连 / 空心=等工牌 / 划掉=服务停了 | 第一版是纯后台 shell 脚本进程，双击毫无反应 —— 用户视角就是"打不开" |
+| 点开是状态面板：服务 pid 与归属（本应用拉起 / 外部进程）、工牌 peer 与 MTU、对话条数 | 排障时不用开终端 |
+| 菜单项：重启 / 停止 / 启动 / 打开诊断页 / 打开日志 / 退出 | 一个入口管所有事，退出时顺带停掉子进程 |
+| 自己 `Process` 拉起 `wb_bridge.py`，但先探测 8765 是否已被占用 | 若终端里已有实例，进入"接管"模式：只监控、不重复启动 |
+| 按 bundle 相对路径解析代码目录 | 源码目录 / `/Applications` / DMG 挂载点三种位置都能跑 |
+| 解释器探测链 `WB_PYTHON` → bundle 内 venv → 托管 venv → Homebrew → 系统，逐个验 `import bleak, numpy` | 不打包 Python 运行时（带 faster-whisper 好几百 MB），缺依赖时弹窗给安装命令 |
 | `WB_VOICE_DIR` / `WB_GW_CACHE` 重定向到 `~/.workbuddy` | DMG 挂载点只读，代码目录旁边写不了文件 |
-| 已在运行就弹「停止 / 重启 / 好」 | 后台服务没有 Dock 图标，再双击一次就得有事可做，也避免两个进程抢蓝牙 |
 
-启动自检：子进程 6 秒内退出会弹告警并给一个「打开日志」按钮，不用自己去翻 `~/.workbuddy/wb_bridge.log`。
+`packaging/launcher/wb-bridge` 是同一套逻辑的纯 shell 版（无菜单栏），留着给"不想要 GUI"的场景用。
 
 ---
 
@@ -401,7 +405,8 @@ ai-passport-workbuddy/
 │   ├── scan.py / serial_listen.py
 │   └── requirements.txt
 ├── packaging/                   .app / DMG 打包素材
-│   ├── launcher/wb-bridge       app 启动器（选解释器 / 单实例 / 启动自检 / 日志轮转）
+│   ├── menubar/main.swift       ★ 菜单栏壳（状态图标 / 状态面板 / 启停 / 打开日志）
+│   ├── launcher/wb-bridge       无 GUI 的 shell 启动器（备选）
 │   ├── Info.plist               bundle 描述（含蓝牙用途说明，TCC 必需）
 │   ├── wbctl                    命令行开关（start/stop/status/log/send/route）
 │   ├── make_icon.py             生成 AppIcon.icns
