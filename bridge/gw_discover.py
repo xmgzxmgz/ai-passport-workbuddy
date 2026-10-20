@@ -810,6 +810,48 @@ def _candidates_impl(sid, verbose=False):
 
 
 
+# ---------------------------------------------------------------------------
+# reply 端点的硬语义：**只服务该实例当前装载着的那一个会话**，投给别的会话
+# 一律 409，且不会落到任何地方（干净）。所以"这条会话现在投不投得进去"只有
+# 一个判据：有没有哪个实例把它当作 activeSessionId / live.sessionId。
+#
+# 反过来不成立 —— 窗口空闲时实例会匿名（activeSessionId=null），此时表里没有
+# 它也未必真投不进去，所以这张表**只能用来判"投不进去"，不能判"投得进去"**。
+# 后者永远以 reply 的 200 + 回读落库为准。
+# ---------------------------------------------------------------------------
+
+_LIVE = {"at": 0.0, "map": {}}
+_LIVE_TTL = 5.0
+
+
+def live_sessions(force=False):
+    """{session_id: base} —— 当前真正装载在某个窗口里的会话。带 5s 缓存。
+
+    面板 1.5s 轮询一次 /conversations，而这里每个端口要打两次 HTTP，所以
+    必须缓存；投递失败判定时会传 force=True 拿当下真值。
+    """
+    now = time.monotonic()
+    if (not force) and now - _LIVE["at"] < _LIVE_TTL:
+        return _LIVE["map"]
+    m = {}
+    try:
+        for inst in discover_instances():
+            sid = inst.get("live_sid") or inst.get("owner_sid")
+            if sid:
+                m.setdefault(str(sid), inst["base"])
+    except Exception:                                 # noqa: BLE001
+        pass
+    _LIVE.update(at=now, map=m)
+    return m
+
+
+def is_live(sid, force=False):
+    """这条会话是否装载在某个窗口里（能投的前提）。"""
+    if not sid:
+        return False
+    return str(sid) in live_sessions(force=force)
+
+
 if __name__ == "__main__":
     found = discover_gateway(verbose=True)
     if not found:

@@ -88,6 +88,7 @@ OFFLINE_AFTER_MS = 60_000
 # 协议限制（必须与 wb_proto.h 一致）
 TITLE_MAX     = 32
 LIST_MAX      = 5         # 下发给工牌的对话条数；屏幕一屏 5 行，不做翻页
+_CONV_FETCH_CAP = 200     # 排序前先多取一些（live 的要能顶到第一页）
 MSG_PAGE_MAX  = 10        # 固件 MSG_SLOTS
 MSG_BODY_MAX  = 120       # WB_TEXT_LEN
 ASR_BODY_MAX  = 170       # 转写回显 ≤ WB_ASR_LEN(200)，留帧头 + UTF-8 余量
@@ -406,6 +407,14 @@ def list_conversations(limit=LIST_MAX, offset=0):
                         lambda: _query_conversations(limit, offset)))
 
 
+def invalidate_conversations():
+    """丢掉对话列表缓存。投递失败后要立刻按"能不能投"重排 —— 缓存不清的
+    话工牌还得抱着旧顺序（死目标排第一），下一条照样发不出去。"""
+    with _query_lock:
+        for k in [k for k in list(_QUERY_CACHE) if k and k[0] == "convs"]:
+            _QUERY_CACHE.pop(k, None)
+
+
 def _query_conversations(limit, offset):
     con = _read_db()
     if con is None:
@@ -418,13 +427,13 @@ def _query_conversations(limit, offset):
             FROM sessions
             WHERE deleted_at IS NULL
             ORDER BY last_activity_at DESC
-            LIMIT ? OFFSET ?
-            """, (limit, offset)).fetchall()
+            LIMIT ?
+            """, (_CONV_FETCH_CAP,)).fetchall()
     except sqlite3.Error:
         con.close()
         return []
     con.close()
-    return [{
+    items = [{
         "id": sid,
         "title": (title or "")[:TITLE_MAX],
         "status": status or "unknown",
@@ -432,6 +441,21 @@ def _query_conversations(limit, offset):
         "updated_at": ts or 0,
         "unread": unread or 0,
     } for sid, title, status, model, ts, unread in rows]
+
+    # 按"能不能投"重排：reply 端点只服务窗口里装载着的那个会话，别的必 409
+    # （2026-10-20 用户报 "Not live on any instance" 就是这么来的 —— 工牌默认
+    # 选列表第一条，而那条恰好是个没打开的旧会话）。把 live 的顶到最前面，
+    # 组内仍按最近活跃，这样"一进来就按 OK 说话"基本都是能投的。
+    try:
+        import gw_discover
+        live = gw_discover.live_sessions()
+    except Exception:                                 # noqa: BLE001
+        live = {}
+    for it in items:
+        it["live"] = it["id"] in live
+        it["instance"] = live.get(it["id"])
+    items.sort(key=lambda x: (not x["live"], -(x["updated_at"] or 0)))
+    return items[offset:offset + limit]
 
 
 def get_running_conversation():
@@ -1605,6 +1629,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "sid": sid,
                     "session_cwd": gw_discover.session_cwd(sid),
                     "heartbeat_endpoint": gw_discover.endpoint_for_session(sid),
+                    # can_deliver=false 就直接别试了：reply 只认装载着的会话，
+                    # 投过去必 409（工牌上会显示"对话未打开"）。
+                    "can_deliver": any(
+                        str(r.get("live")) == str(sid)
+                        or str(r.get("owner")) == str(sid) for r in rows),
+                    "live_now": gw_discover.live_sessions(force=True),
                     "best": rows[0]["base"] if rows else None,
                     "candidates": [
                         {k: r[k] for k in ("base", "score", "why", "owner",
@@ -2032,6 +2062,7 @@ _BUSY_WAIT_MAX = 240         # 最长等目标会话空闲的时间（秒）
 _BUSY_POLL = 2.0
 _VERIFY_WAIT = 12.0          # 投递后回读会话记录、确认真的落库的等待上限（秒）
 _MAX_ATTEMPTS = 12           # 单轮投递最多尝试次数（防重复轰炸）
+_DEAD_AFTER_ROUNDS = 2       # 全实例连续 409 这么多轮就判定"目标没打开"（约 2s）
 
 
 def _session_jsonl(sid):
@@ -2215,37 +2246,22 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
     verified = False
 
     while detail["attempts"] < _MAX_ATTEMPTS:
-        # ---- ① 等目标会话空闲 ----
-        probe = (locked[0], locked[1]) if locked else route
-        busy, _ = _probe_busy(sid, probe)
-        if busy:
-            detail["busy"] = True
-            if not queued:
-                queued = True
-                if on_status:
-                    on_status("Queued")
-                print(f"[SEND] 目标会话在跑，排队等空闲: {str(sid)[:8]}", flush=True)
-            if time.time() < deadline:
-                t0 = time.time()
-                while time.time() < deadline:
-                    time.sleep(_BUSY_POLL)
-                    still, _ = _probe_busy(sid, probe)
-                    if not still:
-                        break
-                detail["waited"] += time.time() - t0
-
         detail["attempts"] += 1
-        baseline = _line_count(_session_jsonl(sid))
 
-        # ---- ② 还没锁定实例：按可信度顺序试探，409 就换下一个 ----
+        # ---- ① 先算候选：它顺带回答了"这会话有没有被某个窗口装载" ----
+        # 顺序很关键。原来是"先探忙闲、再算候选"，而探忙闲本身要跑一遍网关
+        # 发现（实测 1.5~2.3s）。目标根本没装载时，等空闲毫无意义 —— 先把
+        # 候选拿到，没人认领就跳过等待，省掉这段纯空转（用户盯着工牌等）。
+        cands = None
         if locked is None:
             cands = []
             if route and route[0]:
                 cands.append({"base": route[0], "password": route[1],
-                              "why": "pinned"})
+                              "why": "pinned",
+                              "port": route[0].rsplit(":", 1)[-1]})
             try:
                 cands += [c for c in gw_discover.deliver_candidates(
-                    sid, force=detail["attempts"] > 1)
+                    sid, force=detail["attempts"] > 3)
                     if not any(x["base"] == c["base"] for x in cands)]
             except Exception as e:                # noqa: BLE001
                 print(f"[SEND] 候选发现异常: {type(e).__name__}: {e}", flush=True)
@@ -2256,9 +2272,42 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
                     break
                 time.sleep(2.0)
                 continue
+
+        # 有没有实例认领这条会话（live/owner 两条键，刚探过，不额外花钱）
+        claimed = [c for c in (cands or [])
+                   if str(c.get("live")) == str(sid)
+                   or str(c.get("owner")) == str(sid)]
+        claimable = locked is not None or bool(claimed)
+        detail["claimed"] = claimable
+
+        # ---- ② 只有装载着的会话才可能"忙"，也只有它值得等 ----
+        if claimable:
+            probe = (locked[0], locked[1]) if locked else route
+            busy, _ = _probe_busy(sid, probe)
+            if busy:
+                detail["busy"] = True
+                if not queued:
+                    queued = True
+                    if on_status:
+                        on_status("Queued")
+                    print(f"[SEND] 目标会话在跑，排队等空闲: {str(sid)[:8]}",
+                          flush=True)
+                if time.time() < deadline:
+                    t0 = time.time()
+                    while time.time() < deadline:
+                        time.sleep(_BUSY_POLL)
+                        still, _ = _probe_busy(sid, probe)
+                        if not still:
+                            break
+                    detail["waited"] += time.time() - t0
+
+        baseline = _line_count(_session_jsonl(sid))
+
+        # ---- ③ 投递：没锁定实例就按可信度挨个试，409 换下一个 ----
+        if cands is not None:
             for c in cands:
                 rc, info = _reply_raw(c["base"], c["password"], sid, text)
-                detail["tries"].append(f"{c['port']}:{rc}")
+                detail["tries"].append(f"{c.get('port') or c['base'].rsplit(':', 1)[-1]}:{rc}")
                 if rc == 200:
                     locked = (c["base"], c["password"], c["why"])
                     print(f"[SEND] 实例受理 -> {c['base']} [{c['why']}]",
@@ -2275,9 +2324,24 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
             if locked is None:
                 print(f"[SEND] 第 {detail['attempts']} 轮：所有实例都不受理 "
                       f"({','.join(detail['tries'][-6:])})", flush=True)
+                # 全实例 409 = 谁都没装载这个会话。头一轮可能是窗口切换的瞬态，
+                # 但再耗下去就是空转 —— 以前 12 轮 × 2s，用户盯着工牌干等半分钟，
+                # 最后只收到一句 "Not live on any instance"。这里判定：没有任何
+                # 实例认领 -> 它根本没在任何窗口里打开，直接认栽，把"去把那个
+                # 对话点开"这个动作交还给用户。
+                if detail["attempts"] >= _DEAD_AFTER_ROUNDS and not claimed:
+                    detail["not_open"] = True
+                    detail["live_now"] = sorted(
+                        {c["live"] for c in cands if c.get("live")})
+                    last_msg = "对话未打开"
+                    print(f"[SEND] 目标会话不在任何窗口里，停止重试 "
+                          f"{str(sid)[:8]}（当前活会话 "
+                          f"{[str(x)[:8] for x in detail['live_now']] or '无'}）",
+                          flush=True)
+                    break
                 if time.time() >= deadline:
                     break
-                time.sleep(2.0)
+                time.sleep(1.0)          # 换窗口/重启网关的瞬态，给它 1 秒
                 continue
         else:
             rc, info = _reply_raw(locked[0], locked[1], sid, text)
@@ -2290,7 +2354,7 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
                 time.sleep(1.5)
                 continue
 
-        # ---- ③ 回读会话记录验真：只信落库，不信回执 ----
+        # ---- ④ 回读会话记录验真：只信落库，不信回执 ----
         if _verify_landed(sid, text, baseline):
             verified = True
             detail["via"] = locked[2] if locked else None
@@ -2304,7 +2368,8 @@ def deliver_text(sid, text, how="device", route=(None, None), sender_id=None,
 
     if verified:
         return True, "Sent", detail
-    if not detail["busy"]:
+    # 只有"装载在某窗口里"的会话才可能忙；没认领就别再花一次网关发现去探忙闲
+    if not detail["busy"] and detail.get("claimed"):
         try:
             detail["busy"] = _probe_busy(sid, route)[0]
         except Exception:                             # noqa: BLE001
@@ -2381,6 +2446,16 @@ def _deliver(ble: BleCenter, idx: int, text: str):
         print(f"[SEND] ok -> conv={str(sid)[:8]} via {how}/{detail['via']} "
               f"(attempts {detail['attempts']}, waited {detail['waited']:.0f}s, "
               f"probed {detail['probed']})", flush=True)
+    elif detail.get("not_open"):
+        # 不是网络问题、不是忙，是这条对话根本没在任何一个 WorkBuddy 窗口里
+        # 打开 —— 网关的 reply 只认"窗口里装载着的那个会话"，别的必 409。
+        print(f"[SEND] 目标对话未打开: {str(sid)[:8]}（当前活会话 "
+              f"{[str(s)[:8] for s in detail.get('live_now') or []] or '无'}）",
+              flush=True)
+        # 立刻按"能投"重排对话列表：live 的顶到第一条，避免用户再按 OK
+        # 又撞同一个死目标。
+        invalidate_conversations()
+        ble.send(sent_frame(False, "对话未打开"))
     elif detail.get("busy"):
         print(f"[SEND] aborted, target still busy: {str(sid)[:8]}", flush=True)
         ble.send(sent_frame(False, "Session busy"))

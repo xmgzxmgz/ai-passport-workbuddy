@@ -217,6 +217,13 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .row .title.dim { color: var(--dim); }
 .row .meta { font-size: 9.5px; color: var(--faint); white-space: nowrap; }
 .row .sub { font-size: 9px; color: var(--faint); font-family: var(--mono); }
+/* reply 端点只服务"窗口里装载着的那个会话"，其余的投过去必 409 —— 列表里
+   直接标出来，别等用户按了发送才发现投不进去 */
+.row .tag-nolive {
+  margin-left: 6px; padding: 0 4px; border-radius: 3px;
+  font-size: 9px; font-weight: 400; color: var(--faint);
+  border: 1px solid var(--stroke); vertical-align: 1px;
+}
 
 .row .play {
   width: 18px; height: 18px; border-radius: 50%;

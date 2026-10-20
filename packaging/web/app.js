@@ -278,8 +278,8 @@ function renderDashVoice() {
 function renderConvList() {
   const q = ($('#convSearch').value || '').trim().toLowerCase();
   const items = q ? state.convs.filter((c) => (c.title || '').toLowerCase().includes(q)) : state.convs;
-  const sig = items.map((c) => c.id + c.status + c.title).join('|') + '#' + state.selConv
-    + '#' + state.messages.length;
+  const sig = items.map((c) => c.id + c.status + c.title + (c.live ? 'L' : 'x')).join('|')
+    + '#' + state.selConv + '#' + state.messages.length;
   const box = $('#convList');
   if (box.dataset.sig === sig) return;
   box.dataset.sig = sig;
@@ -288,7 +288,8 @@ function renderConvList() {
     <div class="row ${c.id === state.selConv ? 'sel' : ''}" data-conv="${esc(c.id)}">
       <span class="dot ${statusColor(c.status)}"></span>
       <div style="flex:1;min-width:0">
-        <div class="title ${c.id === state.selConv ? '' : 'dim'}">${esc(c.title)}</div>
+        <div class="title ${c.id === state.selConv ? '' : 'dim'}">${esc(c.title)}${
+          c.live ? '' : '<span class="tag-nolive">未打开</span>'}</div>
         <div class="sub">${esc(fmtRel(c.updated_at))}${c.model ? ' · ' + esc(c.model) : ''}</div>
       </div>
     </div>`).join('') || '<div class="hint" style="padding:10px">没有匹配的对话</div>';
@@ -297,6 +298,7 @@ function renderConvList() {
   $('#convTitle').textContent = cur ? cur.title : '选择一个对话';
   $('#convMeta').textContent = cur
     ? `${cur.status} · ${state.messages.length} 条消息${cur.model ? ' · ' + cur.model : ''}`
+      + (cur.live ? ' · 可投递' : ' · 未在窗口打开，投递会 409')
     : '';
 }
 
@@ -337,12 +339,13 @@ function renderMessages() {
 
 function renderTargetSelect() {
   const sel = $('#targetConv');
-  const sig = state.convs.map((c) => c.id).join('|');
+  const sig = state.convs.map((c) => c.id + (c.live ? 'L' : 'x')).join('|');
   if (sel.dataset.sig === sig) return;
   sel.dataset.sig = sig;
   const keep = state.targetConv || '';
   sel.innerHTML = '<option value="">跟随工牌当前选择</option>' +
-    state.convs.map((c) => `<option value="${esc(c.id)}">${esc(c.title)}</option>`).join('');
+    state.convs.map((c) => `<option value="${esc(c.id)}">${esc(c.title)}${
+      c.live ? '' : '（未打开）'}</option>`).join('');
   sel.value = keep;
 }
 
@@ -667,6 +670,11 @@ async function sendDraft() {
       $('#draft').value = '';
       state.msgSig = '';
       loadMessages();
+    } else if (r.message === '对话未打开') {
+      // 网关的 reply 只服务"窗口里装载着的那个会话"，其余一律 409。
+      // 这不是网络问题，重试没用 —— 直接告诉用户该做什么。
+      toast('投递失败：这个对话没在任何窗口打开。先在 WorkBuddy 里点开它，'
+            + '或改投带 live 的对话', 'err');
     } else {
       toast('投递失败：' + (r.message || '未知'), 'err');
     }
