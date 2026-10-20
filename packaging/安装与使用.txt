@@ -1,0 +1,68 @@
+WBBridge —— AI Passport 工牌 → WorkBuddy 中转服务
+==================================================
+
+这个 DMG 里是一个常驻后台的小服务：工牌通过蓝牙把语音/操作发过来，
+它在本机转成文字，再投递到 WorkBuddy 的对话框里。
+
+
+安装
+----
+1. 把 WBBridge.app 拖到左边的「应用程序」文件夹（也可以直接在 DMG 里双击试跑，
+   但装进 /Applications 之后权限记忆更稳）。
+2. 想开机自动启动：系统设置 → 通用 → 登录项 → 「+」→ 选 WBBridge.app。
+3. 首次双击会请求「蓝牙」权限 —— 必须允许，否则一碰蓝牙就会被系统杀掉。
+   如果误点了「不允许」：系统设置 → 隐私与安全性 → 蓝牙 → 勾上 WBBridge。
+4. 工牌开机后会自动连上（屏幕左上角出现电脑图标）。
+
+程序没有 Dock 图标（它是后台服务）。想判断有没有在跑：
+  · 再双击一次 WBBridge.app —— 已在运行会弹窗告诉你 PID，并可一键停止/重启；
+  · 或在终端执行 wbctl status。
+
+
+运行环境
+--------
+服务本身用 Python 跑，需要这些包（已经装好的机器不用管）：
+
+    pip3 install -r /Applications/WBBridge.app/Contents/Resources/bridge/requirements.txt
+
+启动器会自动按顺序找解释器：环境变量 WB_PYTHON → bundle 内 venv →
+~/.workbuddy/binaries/python/envs/default → Homebrew → 系统 python3，
+选第一个能 import bleak / numpy 的。想指定就用：
+
+    launchctl setenv WB_PYTHON /path/to/python3
+
+首次语音转写需要 Whisper 模型（small 约 483MB），会自动下载到
+~/.cache/huggingface；下载过一次就一直复用。
+
+
+常用操作（终端）
+----------------
+    wbctl start | stop | restart | status | log
+    wbctl send "测试一句话" [会话id]    走工牌同一条链路发一条文本
+    wbctl route [会话id]                看这条对话被路由到哪个网关实例
+
+wbctl 就在 DMG 里，想全局可用：
+
+    sudo cp /Volumes/WBBridge/wbctl /usr/local/bin/ && sudo chmod +x /usr/local/bin/wbctl
+
+
+日志与数据
+----------
+    日志     ~/.workbuddy/wb_bridge.log
+    录音     ~/.workbuddy/voice_out/*.wav
+    端口缓存 ~/.workbuddy/.gw_cache.json
+
+服务默认监听 127.0.0.1:8765，只对本机开放。诊断接口：
+
+    curl -s 127.0.0.1:8765/status
+    curl -s 127.0.0.1:8765/health
+    curl -s 127.0.0.1:8765/ble
+
+
+排错
+----
+· 弹「启动失败」：多半是缺 Python 依赖，打开 ~/.workbuddy/wb_bridge.log 看最后几行。
+· 工牌显示已连接但发不出去：WorkBuddy 每个窗口各有一个网关实例，消息只能投进
+  当前正在跑的那个会话。wbctl route 能看到实际路由结果。
+· 电脑换了蓝牙适配器/系统升级后：删掉 系统设置 → 隐私与安全性 → 蓝牙 里的
+  WBBridge 记录，重新双击授权。

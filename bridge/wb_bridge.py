@@ -70,9 +70,13 @@ PROJECTS_DIR = WB_HOME / "projects"
 MAIN_LOG     = WB_HOME / "logs" / "main.log"
 
 BRIDGE_DIR   = Path(__file__).resolve().parent
-VOICE_DIR    = BRIDGE_DIR / "voice_out"
+# 录音落盘目录。默认放在代码旁边（源码目录里跑）；从 .app / DMG 启动时代码
+# 可能位于只读卷（/Volumes/...）或 /Applications 内的 bundle，启动器会用
+# WB_VOICE_DIR 指到 ~/.workbuddy/voice_out，保证读写不依赖安装位置。
+VOICE_DIR    = Path(os.environ.get("WB_VOICE_DIR")
+                    or (BRIDGE_DIR / "voice_out")).expanduser()
 
-HTTP_PORT     = 8765
+HTTP_PORT     = int(os.environ.get("WB_HTTP_PORT") or 8765)
 POLL_INTERVAL = 2
 
 OFFLINE_AFTER_MS = 60_000

@@ -414,6 +414,14 @@ def find_gateway_port(password=None, timeout=1.2):
 # ===========================================================================
 
 def _cache_path():
+    """端口缓存文件位置。
+
+    默认写在代码旁边；从 .app（可能在只读卷）启动时由启动器用
+    WB_GW_CACHE 指到可写位置。缓存只是加速，坏掉也不影响正确性。
+    """
+    env = os.environ.get("WB_GW_CACHE")
+    if env:
+        return Path(env).expanduser()
     return Path(__file__).resolve().parent / ".gw_cache.json"
 
 

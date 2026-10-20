@@ -118,6 +118,27 @@ idf.py -p COM18 flash monitor
 
 ### 2. PC 中转服务
 
+**推荐：装成 app，双击就跑**
+
+```bash
+./scripts/build_dmg.sh          # 产出 dist/WBBridge-1.0.0.dmg
+open dist/WBBridge-1.0.0.dmg    # 挂载后把 WBBridge.app 拖进「应用程序」
+```
+
+app 里已经带了 `bridge/` 全部代码（自包含），双击即启动，第一次会请求蓝牙权限。
+它没有 Dock 图标（后台服务），再双击一次会弹窗告诉你 PID，并可一键停止/重启。
+
+配套的命令行开关 `wbctl`（DMG 里也有，复制到 `~/.local/bin` 即可全局用）：
+
+```bash
+wbctl status    # 进程 / 端口 / 工牌连接 / 对话条数
+wbctl start | stop | restart | log
+wbctl send "内容" [会话id]      # 走工牌同一条链路发一条文本，排障用
+wbctl route [会话id]            # 这条对话被路由到哪个网关实例
+```
+
+**或者直接从源码跑**（改代码调试时用这个）：
+
 ```bash
 cd bridge
 pip install -r requirements.txt
@@ -137,6 +158,10 @@ python wb_bridge.py
 |---|---|---|
 | `WB_WHISPER_MODEL` | `small` | faster-whisper 模型名：`tiny`/`base`/`small`/`medium`/`large-v3` |
 | `WB_WHISPER_LANG` | `zh` | 转写语言 |
+| `WB_HTTP_PORT` | `8765` | 本地 HTTP 端口（只监听 127.0.0.1） |
+| `WB_VOICE_DIR` | 代码旁的 `voice_out/` | 录音落盘目录；app 启动时重定向到 `~/.workbuddy/voice_out` |
+| `WB_GW_CACHE` | 代码旁的 `.gw_cache.json` | 网关端口缓存；app 启动时重定向到 `~/.workbuddy/` |
+| `WB_PYTHON` | 自动探测 | app 启动器用它指定 Python 解释器 |
 | `WB_CLI_DIR` | 自动探测 | WorkBuddy CLI 目录（仅兜底路径用） |
 | `WB_NODE_EXE` | 自动探测 | node 可执行文件（仅兜底路径用） |
 | `WB_ENGINE_ROOT` | `../firmware` | 固件工程根，字库脚本用 |
@@ -151,6 +176,31 @@ python wb_bridge.py
 | LIST | ▲/▼ 选择对话，OK 进入 |
 | DETAIL | ▲/▼ 滚动消息气泡；按 OK 进录音页 |
 | RECORD | OK 开始录音 → OK 结束 → 等 PC 转写 → `HEARD` 卡片回显 → **OK 确认发送** / ▲ 丢弃 |
+
+### 4. 打包成 DMG（实现细节）
+
+```bash
+./scripts/build_dmg.sh            # 出 dist/WBBridge-1.0.0.dmg（当前 ~340KB）
+./scripts/build_dmg.sh --no-icon  # 跳过图标重绘
+```
+
+`scripts/build_dmg.sh` 做的事：
+
+1. `bridge/*.py` 用 `rsync` 塞进 `WBBridge.app/Contents/Resources/bridge/`（排除 `voice_out/`、`.gw_cache.json`、`__pycache__`）；
+2. 拷 `packaging/Info.plist` —— 里面两条 `NSBluetooth*UsageDescription` 是**硬需求**，缺了 python 一碰 CoreBluetooth 就被 SIGKILL（exit 137）；
+3. `codesign --force --deep --sign -` 做 ad-hoc 签名（内容一变必须重签，否则 TCC 把蓝牙授权判成另一个应用）；
+4. `hdiutil create -format UDZO` 出盘，自动挂载自检内容。
+
+启动器 `packaging/launcher/wb-bridge` 的四个关键行为：
+
+| 行为 | 为什么 |
+|---|---|
+| 按 bundle 相对路径解析代码目录 | 源码目录 / `/Applications` / DMG 挂载点三种位置都能跑，不写死绝对路径 |
+| 依次探测解释器（`WB_PYTHON` → bundle 内 venv → 托管 venv → Homebrew → 系统），逐个验证能否 `import bleak, numpy` | 不打包 Python 运行时（带 faster-whisper 好几百 MB），缺依赖时弹窗说清楚怎么装 |
+| `WB_VOICE_DIR` / `WB_GW_CACHE` 重定向到 `~/.workbuddy` | DMG 挂载点只读，代码目录旁边写不了文件 |
+| 已在运行就弹「停止 / 重启 / 好」 | 后台服务没有 Dock 图标，再双击一次就得有事可做，也避免两个进程抢蓝牙 |
+
+启动自检：子进程 6 秒内退出会弹告警并给一个「打开日志」按钮，不用自己去翻 `~/.workbuddy/wb_bridge.log`。
 
 ---
 
@@ -350,6 +400,15 @@ ai-passport-workbuddy/
 │   ├── check_font_coverage.py   检查字库对真实对话的覆盖率
 │   ├── scan.py / serial_listen.py
 │   └── requirements.txt
+├── packaging/                   .app / DMG 打包素材
+│   ├── launcher/wb-bridge       app 启动器（选解释器 / 单实例 / 启动自检 / 日志轮转）
+│   ├── Info.plist               bundle 描述（含蓝牙用途说明，TCC 必需）
+│   ├── wbctl                    命令行开关（start/stop/status/log/send/route）
+│   ├── make_icon.py             生成 AppIcon.icns
+│   ├── AppIcon.icns             图标（构建产物，已提交）
+│   └── 安装与使用.txt            DMG 里附带的说明书
+├── scripts/build_dmg.sh         一条命令出 DMG
+├── dist/                        构建产物（gitignore）
 ├── firmware/                    相对 FoloToy 上游的改动（覆盖式）
 │   ├── main/
 │   │   ├── wb_proto.h           ★ 协议定义，与 bridge 常量表对应
