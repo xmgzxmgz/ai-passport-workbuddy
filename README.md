@@ -3,6 +3,8 @@
 > 把 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport)（ESP32-C3 桌面挂件）改造成 **WorkBuddy 的随身终端**：
 > 挂在显示器边上就能看对话状态、翻最近的消息，按一下直接对着它说话 —— 本地转写成文字、在屏幕上确认，然后投进 PC 上正开着的那个 WorkBuddy 对话。
 
+![AI Passport 工牌 → 本机中转 → WorkBuddy](docs/render/hero.png)
+
 ```
    ┌─────────────────────────────┐
    │  ●  IDLE                    │   ← 状态灯：IDLE / BUSY / OFFLINE
@@ -95,15 +97,6 @@
 
 ![控制台](docs/app-dashboard.png)
 
-<details>
-<summary>其余四页截图</summary>
-
-![对话](docs/app-conversations.png)
-![语音](docs/app-voice.png)
-![日志](docs/app-logs.png)
-![设置](docs/app-settings.png)
-
-</details>
 
 **2. 菜单栏图标** —— 关掉窗口也一直在：
 
@@ -121,9 +114,15 @@
 窗口里的网页通过 `window.webkit.messageHandlers.wb` 调原生能力（打开日志/目录、重启服务），
 在浏览器里这些按钮会退化成提示 —— 因为网页自己没法控制宿主进程。
 
+![主窗口其余四页](docs/render/app-pages.png)
+
 ---
 
 ## 硬件
+
+屏幕三态（按固件 `firmware/main/wb_app.c` 的实坐标与配色渲染，不是示意图）：
+
+![工牌三态](docs/render/badge-states.png)
 
 | 项 | 规格 |
 |---|---|
@@ -483,6 +482,7 @@ ai-passport-workbuddy/
 │   ├── AppIcon.icns             图标（构建产物，已提交）
 │   └── 安装与使用.txt            DMG 里附带的说明书
 ├── scripts/build_dmg.sh         一条命令出 DMG
+├── scripts/make_renders.sh      一条命令出文档渲染图（无头 Chrome 截图）
 ├── dist/                        构建产物（gitignore）
 ├── firmware/                    相对 FoloToy 上游的改动（覆盖式）
 │   ├── main/
@@ -498,6 +498,8 @@ ai-passport-workbuddy/
 │   ├── fonts/                   gen_font.js + symbols.txt
 │   └── sdkconfig.defaults
 └── docs/                        设计文档
+    ├── render/*.html            工牌机身与界面的 CSS 渲染源（照固件坐标写）
+    └── render/*.png             渲染图（hero / badge-states / app-pages）
 ```
 
 ---

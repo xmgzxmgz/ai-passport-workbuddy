@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="render.css">
+<style>
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 34px 36px; margin-top: 28px; }
+  .cell .lbl { margin-top: 12px; font-size: 12px; color: #7C8FA8; letter-spacing: .4px; }
+  .cell .lbl b { color: #E8EFF9; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <div class="title">WBBridge 主窗口 · 总览之外的四页</div>
+  <div class="sub">同一套界面在 <code>WKWebView</code> 与浏览器里共用，1.5 秒同源轮询；<code>#voice</code> / <code>#logs</code> / <code>#settings</code> 可深链接直达（总览见头图）</div>
+
+  <div class="grid">
+
+    <div class="cell">
+      <div class="win">
+        <div class="bar-top"><i></i><i></i><i></i><span>对话 · 完整消息流</span></div>
+        <img src="../app-conversations.png" alt="对话">
+      </div>
+      <div class="lbl"><b>对话</b>　会话列表 + 全文消息流（不是工牌那种 120 字截断），底部可直接发一句测投递</div>
+    </div>
+
+    <div class="cell">
+      <div class="win">
+        <div class="bar-top"><i></i><i></i><i></i><span>语音 · 试听 / 重新转写 / 重新投递</span></div>
+        <img src="../app-voice.png" alt="语音">
+      </div>
+      <div class="lbl"><b>语音</b>　每条录音能试听、换模型重新转写、改完文字再投到任意对话</div>
+    </div>
+
+    <div class="cell">
+      <div class="win">
+        <div class="bar-top"><i></i><i></i><i></i><span>日志 · 只看重要（BLE 空帧 / IDLE 空转已滤掉）</span></div>
+        <img src="../app-logs.png" alt="日志">
+      </div>
+      <div class="lbl"><b>日志</b>　实时尾部刷新，噪声先滤再合并重复（<code>↻ ×N</code>），错误行标红</div>
+    </div>
+
+    <div class="cell">
+      <div class="win">
+        <div class="bar-top"><i></i><i></i><i></i><span>设置 · ASR 模型 / 语言 / 运行环境</span></div>
+        <img src="../app-settings.png" alt="设置">
+      </div>
+      <div class="lbl"><b>设置</b>　换 Whisper 模型与语言（热切换，下次转写生效），看 Python 路径、端口、PID</div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

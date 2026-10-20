@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="render.css">
+<style>
+  .badge-col { --glow: rgba(56,189,248,.2); }
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <div class="title">AI Passport 工牌 · 三态渲染</div>
+  <div class="sub">屏幕内容按固件 <code>wb_app.c</code> 实坐标还原：240×320 · 四张卡 · <code>C_BG #080D16</code> / <code>C_ACCENT #38BDF8</code></div>
+
+  <div class="badge-wrap" style="margin-top:34px;">
+
+    <!-- ---------------- IDLE ---------------- -->
+    <div class="badge-col">
+      <div class="halo s-idle">
+        <div class="body-device">
+          <div class="shell-gloss"></div>
+          <div class="lanyard"></div>
+          <div class="mic"></div>
+          <div class="screen">
+            <div class="hdr">
+              <div class="dot"></div>
+              <div class="st">IDLE</div>
+              <div class="link">BLE 82%</div>
+            </div>
+            <div class="card" style="top:52px;height:74px;">
+              <div class="tag">RUNNING</div>
+              <div class="task">--</div>
+              <div class="model">deepseek-v4.1-flash</div>
+            </div>
+            <div class="card" style="top:132px;height:66px;">
+              <div class="tag">ELAPSED</div>
+              <div class="clock">00:00</div>
+            </div>
+            <div class="card" style="top:204px;height:66px;">
+              <div class="tag">CREDITS</div>
+              <div class="cred">12.4 / 30.0</div>
+              <div class="bar"><i style="width:41%"></i></div>
+            </div>
+            <div class="hint">OK List    UP Light    DOWN Refresh</div>
+          </div>
+          <div class="keys"><div class="key">UP</div><div class="key">DOWN</div><div class="key">OK</div></div>
+          <div class="usbc"></div>
+        </div>
+      </div>
+      <div class="cap">
+        <b class="idle">IDLE</b>
+        <span>网关空闲，绿灯常亮<br>显示模型与额度</span>
+      </div>
+    </div>
+
+    <!-- ---------------- BUSY ---------------- -->
+    <div class="badge-col">
+      <div class="halo s-busy">
+        <div class="body-device">
+          <div class="shell-gloss"></div>
+          <div class="lanyard"></div>
+          <div class="mic"></div>
+          <div class="screen">
+            <div class="hdr">
+              <div class="dot"></div>
+              <div class="st">BUSY</div>
+              <div class="link">BLE 82%</div>
+            </div>
+            <div class="card" style="top:52px;height:74px;">
+              <div class="tag">RUNNING</div>
+              <div class="task">使用五个楼层表开工</div>
+              <div class="model">deepseek-v4.1-flash</div>
+            </div>
+            <div class="card" style="top:132px;height:66px;">
+              <div class="tag">ELAPSED</div>
+              <div class="clock">12:47</div>
+            </div>
+            <div class="card" style="top:204px;height:66px;">
+              <div class="tag">CREDITS</div>
+              <div class="cred">12.4 / 30.0</div>
+              <div class="bar"><i style="width:41%"></i></div>
+            </div>
+            <div class="hint">OK List    UP Light    DOWN Refresh</div>
+          </div>
+          <div class="keys"><div class="key">UP</div><div class="key">DOWN</div><div class="key">OK</div></div>
+          <div class="usbc"></div>
+        </div>
+      </div>
+      <div class="cap">
+        <b class="busy">BUSY</b>
+        <span>正在跑任务，琥珀灯<br>标题 / 模型 / 已耗时 / 额度进度</span>
+      </div>
+    </div>
+
+    <!-- ---------------- OFFLINE ---------------- -->
+    <div class="badge-col">
+      <div class="halo s-offline">
+        <div class="body-device">
+          <div class="shell-gloss"></div>
+          <div class="lanyard"></div>
+          <div class="mic"></div>
+          <div class="screen">
+            <div class="hdr">
+              <div class="dot"></div>
+              <div class="st">OFFLINE</div>
+              <div class="link">BLE --</div>
+            </div>
+            <div class="card" style="top:52px;height:74px;">
+              <div class="tag">RUNNING</div>
+              <div class="task">--</div>
+              <div class="model">--</div>
+            </div>
+            <div class="card" style="top:132px;height:66px;">
+              <div class="tag">ELAPSED</div>
+              <div class="clock">00:00</div>
+            </div>
+            <div class="card" style="top:204px;height:66px;">
+              <div class="tag">CREDITS</div>
+              <div class="cred">--</div>
+              <div class="bar"><i style="width:0%"></i></div>
+            </div>
+            <div class="hint">OK List    UP Light    DOWN Refresh</div>
+          </div>
+          <div class="keys"><div class="key">UP</div><div class="key">DOWN</div><div class="key">OK</div></div>
+          <div class="usbc"></div>
+        </div>
+      </div>
+      <div class="cap">
+        <b class="offline">OFFLINE</b>
+        <span>3 秒收不到 PC 的帧就置灰<br>不显示过期的假状态</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

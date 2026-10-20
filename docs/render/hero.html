@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="render.css">
+<style>
+  .hero { display: flex; gap: 56px; align-items: flex-start; margin-top: 28px; }
+  .hero .left { width: 300px; flex: none; }
+  .hero .right { flex: none; width: 880px; }
+  .hero .halo { margin-top: 6px; }
+  .flow { display: flex; align-items: center; gap: 10px; margin-top: 22px; font-size: 12px; color: #7C8FA8; }
+  .flow b { color: #E8EFF9; font-weight: 600; }
+  .flow em { color: #38BDF8; font-style: normal; }
+  .pill { display:inline-flex; align-items:center; gap:7px; margin-top:18px; padding:7px 13px; border-radius:999px;
+          background: rgba(45,212,167,.10); border:1px solid rgba(45,212,167,.35); font-size:12px; color:#2DD4A7; }
+  .pill i { width:8px; height:8px; border-radius:50%; background:#2DD4A7; box-shadow:0 0 10px #2DD4A7; }
+  .specs { margin-top: 22px; font-size: 11px; line-height: 21px; color: #5f7189; letter-spacing: .3px; }
+  .specs b { color: #9fb0c6; font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <div class="title">AI Passport 工牌 → 本机中转 → WorkBuddy</div>
+  <div class="sub">蓝牙收语音 / 发控制帧，本机 ASR 转写后投递进 WorkBuddy 会话；主窗口是本机 127.0.0.1 上的一套控制台</div>
+
+  <div class="hero">
+
+    <div class="left">
+      <div class="halo s-busy">
+        <div class="body-device">
+          <div class="shell-gloss"></div>
+          <div class="lanyard"></div>
+          <div class="mic"></div>
+          <div class="screen">
+            <div class="hdr">
+              <div class="dot"></div>
+              <div class="st">BUSY</div>
+              <div class="link">BLE 82%</div>
+            </div>
+            <div class="card" style="top:52px;height:74px;">
+              <div class="tag">RUNNING</div>
+              <div class="task">使用五个楼层表开工</div>
+              <div class="model">deepseek-v4.1-flash</div>
+            </div>
+            <div class="card" style="top:132px;height:66px;">
+              <div class="tag">ELAPSED</div>
+              <div class="clock">12:47</div>
+            </div>
+            <div class="card" style="top:204px;height:66px;">
+              <div class="tag">CREDITS</div>
+              <div class="cred">12.4 / 30.0</div>
+              <div class="bar"><i style="width:41%"></i></div>
+            </div>
+            <div class="hint">OK List    UP Light    DOWN Refresh</div>
+          </div>
+          <div class="keys"><div class="key">UP</div><div class="key">DOWN</div><div class="key">OK</div></div>
+          <div class="usbc"></div>
+        </div>
+      </div>
+      <div class="cap" style="text-align:left;">
+        <b class="busy">BUSY</b>
+        <span>工牌只做三件事：报状态、收语音、放结果</span>
+      </div>
+      <div class="specs">
+        <b>ESP32-C3</b> · 8MB Flash · BLE 5 · 无 PSRAM<br>
+        <b>240×320</b> ST7789P3 · ES8311 音频 · 3 键<br>
+        <b>520mAh</b> · 60×95×8.5mm · 约 50g
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="win">
+        <div class="bar-top"><i></i><i></i><i></i><span>WBBridge · 工牌中转 · 127.0.0.1</span></div>
+        <img src="../app-dashboard.png" alt="控制台">
+      </div>
+      <div class="pill"><i></i>服务在跑 · 工牌已连（MTU 247）· 8766 端口</div>
+      <div class="flow"><b>工牌</b> —BLE 5→ <em>WBBridge.app</em> —HTTP 127.0.0.1→ <em>/ui 控制台</em> —reply→ <b>WorkBuddy 会话</b></div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>
