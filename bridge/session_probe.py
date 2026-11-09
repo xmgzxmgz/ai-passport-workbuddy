@@ -1,14 +1,21 @@
 import json
+import os
 import re
 import time
 
-P = ("/Users/xiamuguizhi/.workbuddy/projects/"
-     "Users-xiamuguizhi-WorkBuddy-2026-10-15-08-59-10/"
-     "fb0f0677-3969-4f4d-819a-25b9fe8b93fb.jsonl")
+# 会话文件路径由环境变量提供，不再硬编码本机绝对路径：
+#   WB_SESSION_JSONL=~/.workbuddy/projects/<project>/<session>.jsonl python session_probe.py
+DEFAULT_PATH = os.environ.get("WB_SESSION_JSONL", "")
 
 
-def user_msgs(path=P, tail=20):
+def user_msgs(path=None, tail=20):
     """列出会话里真实用户消息 (时间, 文本)，已剔除 system-reminder。"""
+    path = os.path.expanduser(path or DEFAULT_PATH)
+    if not path:
+        raise SystemExit(
+            "未指定会话文件。请用环境变量传入，例如：\n"
+            "  WB_SESSION_JSONL=~/.workbuddy/projects/<project>/<session>.jsonl python session_probe.py"
+        )
     out = []
     for ln in open(path, encoding="utf-8", errors="replace"):
         try:
